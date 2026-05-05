@@ -1,0 +1,226 @@
+"""FastMCP middleware for tri-state governance with scoped elevation and elicitation."""
+
+import asyncio
+import hashlib
+import time
+from typing import Any, Dict, List, Optional
+
+from fastmcp import Context
+from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import Middleware
+from loguru import logger
+
+from .audit import audit_logger, AuditEvent
+from .config import Config
+from .governance.approval import (
+    ApprovalDecision,
+    ApprovalRequest,
+    get_approval_provider,
+)
+from .governance.artifacts import get_artifact_generator
+from .governance.tokens import verify_token
+from .leases import lease_manager
+from .registry import tool_registry
+from .state import ExecutionMode, governance_state
+from .toon import encode_output
+
+
+# Constants
+SENSITIVE_TOOLS = {
+    # File operations
+    "write_file",
+    "delete_file",
+    "move_file",
+    "create_directory",
+    "remove_directory",
+    # Command execution
+    "execute_command",
+    # Git operations
+    "git_commit",
+    "git_push",
+    "git_reset",
+    # Admin operations
+    "set_governance_mode",
+    "revoke_all_elevations",
+}
+
+ELICITATION_TIMEOUT = Config.ELICITATION_TIMEOUT
+DEFAULT_ELEVATION_TTL = Config.DEFAULT_ELEVATION_TTL
+
+
+class GovernanceMiddleware(Middleware):  # L51
+    # ... [lines 52-826 omitted]
+    def _apply_toon_encoding(result: Any) -> Any:  # L68
+        """
+        Apply TOON encoding to tool result if enabled.
+
+        Args:
+            result: Tool execution result
+
+        Returns:
+            Encoded result if TOON enabled, otherwise unchanged result
+        """
+        if not Config.ENABLE_TOON_OUTPUTS:
+            return result
+
+        try:
+            return encode_output(result, threshold=Config.TOON_ARRAY_THRESHOLD)
+        except Exception as e:
+            # Fail-safe: return original result if encoding fails
+            logger.warning(f"TOON encoding failed: {e}, returning original result")
+            return result
+    # ... [lines 87-88 omitted]
+    def _extract_context_key(tool_name: str, arguments: Dict[str, Any]) -> str:  # L89
+        """
+        Extract context key for scoped elevation.
+
+        Args:
+            tool_name: Name of the tool
+            arguments: Tool arguments
+
+        Returns:
+            Context key (path for file ops, command[:50] for commands)
+        """
+        # Move operation: use source path (MUST check BEFORE general file ops)
+        if tool_name == "move_file":
+            return arguments.get("source", "unknown")
+
+        # File operations: use path
+        if tool_name in {
+            "write_file",
+            "delete_file",
+            "read_file",
+        }:
+            return arguments.get("path", "unknown")
+
+        # Directory operations: use path
+        if tool_name in {"create_directory", "remove_directory", "list_directory"}:
+            return arguments.get("path", "unknown")
+
+        # Command execution: use first 50 chars of command
+        if tool_name == "execute_command":
+            command = arguments.get("command", "unknown")
+            return command[:50] if len(command) > 50 else command
+
+        # Git operations: use current directory
+        if tool_name.startswith("git_"):
+            return arguments.get("cwd", ".")
+
+        # Admin operations: use operation name
+        if tool_name in {"set_governance_mode", "revoke_all_elevations"}:
+            return tool_name
+
+        # Default: tool name
+        return tool_name
+    # ... [lines 131-131 omitted]
+    def _compute_elevation_key(  # L132
+        self, tool_name: str, arguments: Dict[str, Any], session_id: str
+    ) -> str:
+        """
+        Compute elevation key using SHA256 hash.
+
+        Args:
+            tool_name: Name of the tool
+            arguments: Tool arguments
+            session_id: Session identifier
+
+        Returns:
+            Elevation hash key
+        """
+        context_key = self._extract_context_key(tool_name, arguments)
+        return governance_state.compute_elevation_hash(
+            tool_name=tool_name,
+            context_key=context_key,
+            session_id=session_id,
+        )
+    # ... [lines 152-152 omitted]
+    async def _check_elevation(  # L153
+        self, tool_name: str, arguments: Dict[str, Any], session_id: str
+    ) -> bool:
+        """
+        Check if scoped elevation exists.
+
+        Args:
+            tool_name: Name of the tool
+            arguments: Tool arguments
+            session_id: Session identifier
+
+        Returns:
+            True if elevation exists, False otherwise
+        """
+        elevation_key = self._compute_elevation_key(tool_name, arguments, session_id)
+        return await governance_state.check_elevation(elevation_key)
+    # ... [lines 169-169 omitted]
+    async def _grant_elevation(  # L170
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        session_id: str,
+        ttl: int = DEFAULT_ELEVATION_TTL,
+    ) -> bool:
+        """
+        Grant scoped elevation.
+
+        Args:
+            tool_name: Name of the tool
+            arguments: Tool arguments
+            session_id: Session identifier
+            ttl: Time-to-live for elevation
+
+        Returns:
+            True if elevation was granted, False otherwise
+        """
+        elevation_key = self._compute_elevation_key(tool_name, arguments, session_id)
+        context_key = self._extract_context_key(tool_name, arguments)
+
+        # Grant elevation in Redis
+        granted = await governance_state.grant_elevation(elevation_key, ttl)
+
+        if granted:
+            # Audit elevation grant
+            audit_logger.log_elevation_granted(
+                tool_name=tool_name,
+                context_key=context_key,
+                session_id=session_id,
+                ttl=ttl,
+            )
+
+        return granted
+    # ... [lines 205-206 omitted]
+    def _generate_request_id(  # L207
+        session_id: str, tool_name: str, context_key: str
+    ) -> str:
+        """
+        Generate stable request ID for approval requests.
+
+        Format: {session_id_hash}_{tool_name}_{context_hash}_{timestamp_ms}
+
+        Args:
+            session_id: Session identifier
+            tool_name: Name of the tool
+            context_key: Context key (path, command, etc.)
+
+        Returns:
+            Stable request ID for this approval request
+        """
+        # Hash session_id for privacy (first 8 chars)
+        session_hash = hashlib.sha256(session_id.encode()).hexdigest()[:8]
+
+        # Hash context_key to keep request_id readable (first 8 chars)
+        context_hash = hashlib.sha256(context_key.encode()).hexdigest()[:8]
+
+        # Use monotonic timestamp in milliseconds for uniqueness
+        timestamp_ms = int(time.monotonic() * 1000)
+
+        return f"{session_hash}_{tool_name}_{context_hash}_{timestamp_ms}"
+    # ... [lines 233-234 omitted]
+    def _get_required_scopes(tool_name: str, arguments: Dict[str, Any]) -> List[str]:  # L235
+    # ... [lines 236-288 omitted]
+    def _format_approval_request(  # L291
+    # ... [lines 292-330 omitted]
+    def _parse_approval_response(response: str) -> bool:  # L333
+    # ... [lines 334-366 omitted]
+    async def _elicit_approval(  # L368
+    # ... [lines 369-622 omitted]
+    async def on_call_tool(self, context: Context, call_next):  # L624
+    # ... [lines 625-826 omitted]

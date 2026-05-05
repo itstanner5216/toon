@@ -1,0 +1,182 @@
+"""Content-aware string compression for stack traces, JSON-in-string, logs.
+
+Detection priority:
+  1. Stack trace → FaST-inspired (ICSE 2022) frame priority scoring
+  2. JSON-in-string → depth-limited traversal with budget inheritance
+  3. Log output → normalize+hash dedup with severity priority
+  4. Default → adaptive head/tail truncation (NOT fixed 70/30)
+
+Each strategy operates within a character budget and preserves the
+information an LLM most needs to reason about the content.
+
+Zero external dependencies. Pure Python.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from ._utils import blake2b_hash, NORMALIZERS
+
+# Detection patterns
+_STACK_TRACE_RE = re.compile(
+    r'(Traceback|Exception|Error|Caused by:|^\s+at\s+|^\s+File\s+")',
+    re.MULTILINE,
+)
+_LOG_SEVERITY_RE = re.compile(
+    r'\b(DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|CRITICAL)\b',
+    re.IGNORECASE,
+)
+_TIMESTAMP_LINE_RE = re.compile(
+    r'^\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}',
+    re.MULTILINE,
+)
+_ERROR_KEYWORDS = frozenset({
+    'error', 'fatal', 'critical', 'exception', 'traceback',
+    'caused by', 'failed', 'killed', 'oom', 'panic', 'crash', 'abort',
+})
+_FRAME_RE = re.compile(r'^\s+(at\s+|File\s+")', re.MULTILINE)
+_USER_FRAME_EXCLUDES = re.compile(
+    r'(java\.|javax\.|sun\.|org\.springframework\.|org\.python\.|'
+    r'importlib\.|_bootstrap|site-packages)'
+)
+
+
+def compress_string(text: str, budget: int, max_user_frames: int = 10) -> str:  # L47
+    """Compress a string using content-type detection and type-specific strategies.
+
+    Dispatches to the most appropriate compressor based on content analysis:
+    stack traces, JSON-in-string, log output, or adaptive truncation.
+
+    Args:
+        text: Input string.
+        budget: Maximum character budget for output.
+        max_user_frames: Max user-code frames to retain in stack traces.
+
+    Returns:
+        Compressed string within budget.
+    """
+    if len(text) <= budget:
+        return text
+
+    # Source code check runs first — import/def patterns are unambiguous structural
+    # signals and prevent false-positive stack-trace or log detection on source files.
+    if _is_source_code(text):
+        return _compress_source_code(text, budget)
+
+    if _is_stack_trace(text):
+        return _compress_stack_trace(text, budget, max_user_frames)
+
+    if _is_json_string(text):
+        try:
+            parsed = json.loads(text)
+            return _compress_json(parsed, budget, depth=0)
+        except (json.JSONDecodeError, RecursionError):
+            pass
+
+    if _is_log_output(text):
+        return _compress_log(text, budget)
+
+    return _content_aware_truncate(text, budget)
+
+
+#  Content Type Detection
+
+def _is_stack_trace(text: str) -> bool:  # L87
+    """Detect stack traces by scanning the first 2000 chars for frame patterns."""
+    return bool(_STACK_TRACE_RE.search(text[:2000]))
+
+
+def _is_json_string(text: str) -> bool:  # L92
+    """Detect JSON-in-string by checking for leading { or [."""
+    stripped = text.strip()
+    return (stripped.startswith('{') or stripped.startswith('[')) and len(stripped) > 2
+
+
+def _is_log_output(text: str) -> bool:  # L98
+    """Detect log output by counting timestamps and severity keywords in first 20 lines."""
+    lines = text.split('\n', 20)
+    ts_count = sum(1 for line in lines if _TIMESTAMP_LINE_RE.match(line))
+    sev_count = sum(1 for line in lines if _LOG_SEVERITY_RE.search(line))
+    return ts_count >= 3 or sev_count >= 3
+
+
+#  Stack Trace Compression (FaST-inspired, ICSE 2022)
+
+def _compress_stack_trace(text: str, budget: int, max_user_frames: int) -> str:  # L108
+    # ... [lines 109-170 omitted]
+
+
+#  JSON-in-String Compression
+
+def _compress_json(obj: Any, budget: int, depth: int) -> str:  # L175
+    # ... [lines 176-262 omitted]
+
+
+#  Log Output Compression
+
+def _compress_log(text: str, budget: int) -> str:  # L267
+    # ... [lines 268-357 omitted]
+
+
+#  Source Code Compression
+
+# Names that signal "this is the entry point you came to read"
+_ENTRY_POINT_NAMES = frozenset({
+    '__init__', '__call__', '__enter__', '__exit__',
+    '__aenter__', '__aexit__', '__str__', '__repr__',
+    '__len__', '__iter__', '__next__', '__getitem__', '__setitem__', '__contains__',
+    'main', 'run', 'start', 'stop', 'close', 'open', 'setup', 'teardown', 'reset',
+    'compress', 'decompress', 'encode', 'decode',
+    'search', 'query', 'find', 'get', 'fetch',
+    'build', 'build_index', 'index', 'add', 'remove', 'update', 'delete',
+    'handle', 'on_call_tool', 'execute', 'process', 'dispatch', 'call', 'invoke',
+    'create', 'insert', 'save', 'load', 'read', 'write',
+    'connect', 'disconnect', 'send', 'receive', 'listen',
+    'validate', 'parse', 'serialize', 'deserialize', 'from_dict', 'to_dict',
+    'feed', 'transform', 'apply', 'fit', 'predict',
+    'register', 'unregister', 'subscribe', 'unsubscribe',
+    'allocate', 'score', 'rank', 'deduplicate',
+})
+
+# Dunder methods that behave like public entry points
+_DUNDER_KEEPERS = frozenset({
+    '__init__', '__call__', '__enter__', '__exit__', '__aenter__', '__aexit__',
+    '__str__', '__repr__', '__len__', '__iter__', '__next__',
+    '__getitem__', '__setitem__', '__contains__',
+})
+
+# Matches the start of a function/class/method definition (applied to stripped line)
+_DEF_RE = re.compile(
+    r'^(?:(?:async\s+)?def\s+(\w+)'                                             # Python def
+# ... [lines 390-404 omitted]
+def _is_source_code(text: str) -> bool:  # L405
+    """Detect Python or JS/TS source by keyword density in first 50 lines."""
+    score = 0
+    for line in text.split('\n', 50):
+        s = line.strip()
+        if not s or s.startswith('#'):
+            continue
+        if s.startswith(('import ', 'from ')):
+            score += 2
+        elif _DEF_RE.match(s):
+            score += 3
+        elif s.startswith(('export ', 'require(')):
+            score += 2
+        elif s.startswith(('const ', 'let ', 'var ')):
+            score += 1
+        elif s.startswith(('"""', "'''")):
+            score += 1
+    return score >= 5
+# ... [lines 423-424 omitted]
+def _compress_source_code(text: str, budget: int) -> str:  # L425
+    # ... [lines 426-606 omitted]
+    def lc(idx: int) -> int:  # L534
+        return len(lines[idx]) + 1
+# ... [lines 536-610 omitted]
+def compress_source_structured(text: str, budget: int, structure: list[dict]) -> str:  # L611
+    # ... [lines 612-770 omitted]
+def _content_aware_truncate(text: str, budget: int) -> str:  # L775
+    # ... [lines 776-808 omitted]

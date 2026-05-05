@@ -1,0 +1,215 @@
+"""TOON compression pipeline: dedup → scoring → budget-aware compression.
+
+Stage 1: Dedup (exact/near/template) — LogCleaner (ESEM 2024)
+Stage 2: SageRank centrality + BMX+ relevance — 5-phase algorithm
+Stage 3: Per-tier budget allocation (60/30/10) — LLMLingua (ACL 2024)
+
+Zero external dependencies. Pure Python.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any
+
+from engines.bmx_plus import BMXPlusIndex
+from engines.sagerank import SageRank
+from .dedup import Deduplicator, DedupResult
+from .budget import BudgetAllocator, BudgetAllocation
+from .string_codec import compress_string
+from .encoder import _encode_recursive
+from ._utils import (
+    flatten_to_text, estimate_tokens, estimate_tokens_obj,
+    compute_gini, find_kneedle, pearson_r,
+)
+import hashlib
+import random
+
+logger = logging.getLogger(__name__)
+
+
+#  Configuration
+
+@dataclass
+class CompressConfig:  # L35
+    """Configuration for the TOON compression pipeline.
+
+    All defaults are documented with their evidence basis.
+    Engineering heuristics are explicitly flagged as unvalidated.
+    """
+
+    # Self-scoring parameters
+    core_fraction_method: str = "kneedle"
+    """Method for adaptive core_fraction detection.
+    Default: "kneedle" — Satopää et al. 2011, IEEE ICDCS.
+    Alternative: "fixed" uses core_fraction_fixed value."""
+
+    core_fraction_fixed: float = 0.15
+    """Fixed core fraction (used only when core_fraction_method="fixed").
+    Engineering heuristic — not empirically validated."""
+
+    gini_threshold: float = 0.2
+    """Gini coefficient below which self-scoring is abandoned.
+    Derived from T-Retrievability (Ganguly 2025, arXiv:2508.21704).
+    Below 0.2 → corpus is undifferentiated, self-scoring uninformative."""
+
+    hubness_z_threshold: float = 3.0
+    """Median/MAD z-score threshold for hub detection.
+    Based on adversarial hubness research (Cisco 2026).
+    Hubs with z > 3.0 are capped at median + 2·MAD."""
+
+    redundancy_r_threshold: float = 0.95
+    """Pearson r above which Phase 2/4 correlation indicates redundancy.
+    Engineering heuristic — not empirically validated."""
+
+    # Dedup parameters
+    dedup_scope: str = "session"
+    """Dedup scope: "session" (LRU-bounded), "turn" (per-call reset), "none"."""
+
+    dedup_maxsize: int = 5000
+    """LRU cache size for dedup fingerprints.
+    At 5000, memory overhead ≈ 500KB. Covers typical session lengths."""
+
+    # String codec parameters
+    string_budget_ratio: float = 0.5
+    """Budget halving per JSON depth level.
+    Engineering heuristic — not empirically validated."""
+
+    stack_trace_max_user_frames: int = 10
+    """Max user-code frames to retain in stack trace compression.
+    FaST heuristic (ICSE 2022): position × rarity scoring.
+    Gap: no empirical N for LLM-reading context. 10 is conservative."""
+
+    # Budget parameters
+    tier_ratios: dict[str, float] = field(default_factory=lambda: {
+        "high": 0.60, "medium": 0.30, "low": 0.10,
+    })
+    """Budget distribution across tiers.
+    Informed by LLMLingua ablation: per-component > uniform (EM 79.08 vs 73.62).
+    Source: https://aclanthology.org/2024.acl-long.91/"""
+
+    # Processing limits
+    min_entries_for_scoring: int = 5
+    """Minimum entries needed to run self-scoring. Below this, preserve all."""
+
+    sagerank_top_k: int = 0
+    """If > 0, use SageRank for within-entry sentence ranking at this top-k.
+    0 = disabled (entries scored but not internally reranked)."""
+
+    # Field routing
+    preserve_fields: frozenset[str] = frozenset({
+        'error', 'exception', 'message', 'status', 'code', 'id', 'type', 'name',
+    })
+    """Field names that are always preserved at full fidelity."""
+
+    encode_fields: frozenset[str] = frozenset({
+        'data', 'results', 'items', 'records', 'rows', 'entries', 'payload',
+    })
+    """Field names that are candidates for array compression."""
+
+
+#  Data Contracts
+
+@dataclass
+class ScoredEntries:  # L115
+    """Output of the scoring stage (Stage 2)."""
+    entries: list[dict]
+    scores: list[float]
+    tiers: list[str]
+    core_indices: list[int]
+    scoring_stats: dict
+
+
+@dataclass
+class CompressedOutput:  # L125
+    """Final pipeline output (Stage 3)."""
+    entries: list[Any]
+    budget_used: int
+    stats: dict
+
+
+#  Streaming Mode
+
+class TOONCompressor:  # L134
+    # ... [lines 135-166 omitted]
+    def __init__(self, config: CompressConfig | None = None):  # L149
+        self.config = config or CompressConfig()
+        self._deduplicator = Deduplicator(maxsize=self.config.dedup_maxsize)
+    # ... [lines 152-152 omitted]
+    def feed(self, entry: Any) -> Any | None:  # L153
+        """Process a single entry in streaming mode.
+
+        Returns compressed entry, or None if deduplicated away.
+        """
+        result = self._deduplicator.deduplicate([entry])
+        if not result.entries:
+            return None
+        content = result.entries[0]["content"]
+        return _compress_entry(content, budget=None, config=self.config)
+    # ... [lines 163-163 omitted]
+    def reset(self):  # L164
+        """Reset dedup state (session boundary)."""
+        self._deduplicator.reset()
+
+
+#  Functional API
+
+def compress(  # L171
+    data: Any,
+    budget: int | None = None,
+    query: str | None = None,
+    config: CompressConfig | None = None,
+) -> Any:
+    """Full TOON compression pipeline.
+
+    Runs all three stages: dedup → self-scoring → budget-aware compression.
+
+    Args:
+        data: Tool output data. Can be a single object or list of objects.
+        budget: Target token budget. None = auto (50% of original size).
+        query: Optional query to bias relevance scoring toward.
+        config: Pipeline configuration. None = defaults.
+
+    Returns:
+        Compressed data (same top-level type as input).
+    """
+    cfg = config or CompressConfig()
+
+    # Normalize input to list
+    is_single = not isinstance(data, list)
+    entries = [data] if is_single else data
+
+    if not entries:
+        return data
+
+    # Default budget: 50% of original size
+    if budget is None:
+        original_tokens = sum(estimate_tokens_obj(e) for e in entries)
+        budget = max(100, original_tokens // 2)
+
+    # Stage 1: Structural Decomposition & Dedup
+    deduplicator = Deduplicator(maxsize=cfg.dedup_maxsize)
+    dedup_result = deduplicator.deduplicate(entries)
+
+    if not dedup_result.entries:
+        return [] if not is_single else None
+
+    # Stage 2: Self-Scoring & Relevance Ranking
+    scored = _score_entries(dedup_result, query, cfg)
+
+    # Stage 3: Budget-Aware Compression
+    allocation = BudgetAllocator.allocate(
+        scored.entries, scored.scores, scored.tiers, budget
+    )
+
+    compressed = _compress_entries(scored, allocation, cfg)
+
+    if is_single and compressed.entries:
+        return compressed.entries[0]
+    return compressed.entries
+
+
+#  Stage 2: Self-Scoring & Relevance Ranking (5-Phase Algorithm)
+
+def _score_entries(  # L228

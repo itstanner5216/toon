@@ -1,0 +1,38 @@
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { randomBytes, createHash } from 'crypto';
+import { getProjectContext } from '../core/project-context.js';
+import {
+    getDb, indexDirectory, ensureIndexFresh, indexFile,
+    impactQuery, getSessionId, findRepoRoot, snapshotSymbol,
+    getVersionHistory, getVersionText,
+} from '../core/symbol-index.js';
+import {
+    getLangForFile, findSymbol, getSymbolStructure, checkSyntaxErrors,
+} from '../core/tree-sitter.js';
+import { applyEditList, syntaxWarn } from '../core/edit-engine.js';
+import { normalizeLineEndings } from '../core/lib.js';
+
+// ---------------------------------------------------------------------------
+// Module-level constants
+// ---------------------------------------------------------------------------
+# ... [lines 20-114 omitted]
+export function register(server, ctx) {  # L115
+    server.registerTool("refactor_batch", {
+        title: "Refactor Batch",
+                # ... [lines 118-153 omitted]
+                return { content: [{ type: 'text', text: 'target required for query.' }] };
+                # ... [lines 155-186 omitted]
+                return { content: [{ type: 'text', text: 'Multiple definitions:\n' + result.definitions.join('\n') }] };
+                # ... [lines 188-198 omitted]
+                return { content: [{ type: 'text', text: 'No references.' }] };
+                    # ... [lines 200-204 omitted]
+                    return `${idx}) ${r.name}[${r.refCount}x] (${r.filePath})`;
+                }
+                return `${idx}) ${r.name}[${r.callCount}x]`;
+            });
+            return { content: [{ type: 'text', text: lines.join('\n') }] };
+                # ... [lines 211-217 omitted]
+                return { content: [{ type: 'text', text: 'selection required for loadDiff (or use loadMore=true to continue).' }] };
+                    return { content: [{ type: 'text', text: 'Nothing to continue.' }] };

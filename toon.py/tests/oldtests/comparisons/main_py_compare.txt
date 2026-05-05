@@ -1,0 +1,4009 @@
+================================================================================
+FILE: /home/tanner/Projects/litellm-pgvector-main/main.py
+Original: 60,350 chars  |  1621 lines
+================================================================================
+
+[ ORIGINAL ]
+================================================================================
+"""
+OpenAI-compatible Vector Stores API using PGVector.
+
+This module provides the FastAPI application with endpoints for creating,
+listing, and searching vector stores, as well as managing embeddings.
+"""
+
+import asyncio
+import logging
+import math
+import re
+import time
+import uuid
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any
+from collections.abc import AsyncIterator
+
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from prisma import Prisma  # type: ignore[attr-defined]
+from dotenv import load_dotenv
+
+from models import (
+    ContentChunk,
+    DeleteEmbeddingsResponse,
+    EmbeddingBatchCreateRequest,
+    EmbeddingBatchCreateResponse,
+    EmbeddingCreateRequest,
+    EmbeddingResponse,
+    SearchResult,
+    VectorStoreCreateRequest,
+    VectorStoreListResponse,
+    VectorStoreResponse,
+    VectorStoreSearchRequest,
+    VectorStoreSearchResponse,
+    VectorStoreSourcesResponse,
+)
+from config import settings
+from embedding_service import embedding_service
+from project_registry import ProjectRegistry
+from retrieval_bmx import BMXIndex
+from retrieval_hybrid import BM25StoreCache, BM25StoreState
+from symbol_table import (
+    build_symbol_record,
+    delete_symbol_records,
+    insert_symbol_records,
+    merge_tiered_results,
+    search_symbols_exact,
+    search_symbols_fuzzy,
+)
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+DEFAULT_FILE_COUNTS = {
+    "in_progress": 0,
+    "completed": 0,
+    "failed": 0,
+    "cancelled": 0,
+    "total": 0,
+}
+DEFAULT_CORS_ALLOW_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+
+# ---------------------------------------------------------------------------
+# Regex for identifier splitting (compiled once at module level)
+# ---------------------------------------------------------------------------
+_CAMEL_SPLIT_RE = re.compile(r"([a-z])([A-Z])")
+_ALLCAPS_SPLIT_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_HAS_CAMEL_RE = re.compile(r"[a-z][A-Z]")
+_HAS_ALLCAPS_TRANSITION_RE = re.compile(r"[A-Z]{2,}[a-z]")
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+db = Prisma()
+
+# ---------------------------------------------------------------------------
+# Singletons / Caches
+# ---------------------------------------------------------------------------
+_bm25_cache = BM25StoreCache()  # type: ignore[no-untyped-call]
+_project_registry: ProjectRegistry | None = None
+
+
+def get_project_registry() -> ProjectRegistry:
+    """Lazy-load and cache the project registry from disk."""
+    global _project_registry
+    if _project_registry is None:
+        _project_registry = ProjectRegistry.load(settings.ragconfig_path)
+    return _project_registry
+
+
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Connect to DB on startup, disconnect on shutdown."""
+    await db.connect()
+    logger.info("Database connected")
+    yield
+    await db.disconnect()
+    logger.info("Database disconnected")
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="OpenAI Vector Stores API",
+    description="OpenAI-compatible Vector Stores API using PGVector",
+    version="2.1.0",  # CHANGED: bumped version for this overhaul
+    lifespan=lifespan,
+)
+
+cors_allow_origins = [
+    origin.strip()
+    for origin in settings.cors_allow_origins.split(",")
+    if origin.strip()
+]
+cors_allow_origin_regex = settings.cors_allow_origin_regex.strip() or None
+if not cors_allow_origins and cors_allow_origin_regex is None:
+    cors_allow_origins = DEFAULT_CORS_ALLOW_ORIGINS
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_allow_origins,
+    allow_origin_regex=cors_allow_origin_regex,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+security = HTTPBearer()
+
+
+# ---------------------------------------------------------------------------
+# Middleware — request ID + error handling
+# ---------------------------------------------------------------------------
+@app.middleware("http")  # type: ignore[untyped-decorator]
+async def request_context_middleware(request: Request, call_next: Any) -> Response:
+    """Attach a unique request ID and handle uncaught exceptions uniformly."""
+    request_id = request.headers.get("X-Request-ID", uuid.uuid4().hex[:12])
+    request.state.request_id = request_id
+    try:
+        response: Response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception:
+        logger.warning("Unhandled exception [request_id=%s]", request_id, exc_info=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Type alias for untyped dicts returned from the DB
+# ---------------------------------------------------------------------------
+RowDict = dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+async def get_api_key(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> str:
+    """Validate the Bearer token against the configured server API key."""
+    if credentials.credentials != settings.server_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return credentials.credentials  # type: ignore[no-any-return]
+
+
+# ---------------------------------------------------------------------------
+# Helpers — time conversion
+# ---------------------------------------------------------------------------
+def _to_unix_ts(val: Any) -> int | None:
+    """Convert a datetime, ISO-8601 string, or None → Unix timestamp int."""
+    if val is None:
+        return None
+    if hasattr(val, "timestamp"):
+        return int(val.timestamp())
+    try:
+        dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Helpers — SQL query builder
+# ---------------------------------------------------------------------------
+class QueryBuilder:
+    """
+    Lightweight helper to build parameterized SQL without manual $N counting.
+
+    Usage:
+        qb = QueryBuilder()
+        qb.add_condition("name = {}", "Alice")
+        ph = qb.add_param(some_value)
+        qb.add_raw_condition(f"col = {ph}")
+        where = qb.where_sql()
+        params = qb.params
+    """
+
+    def __init__(self, *, start_param: int = 1) -> None:
+        self._conditions: list[str] = []
+        self._params: list[Any] = []
+        self._counter = start_param
+
+    @property
+    def param_count(self) -> int:
+        return self._counter
+
+    @property
+    def params(self) -> list[Any]:
+        return list(self._params)
+
+    def add_param(self, value: Any) -> str:
+        """Register a parameter and return its $N placeholder."""
+        ph = f"${self._counter}"
+        self._counter += 1
+        self._params.append(value)
+        return ph
+
+    def add_condition(self, template: str, *values: Any) -> "QueryBuilder":
+        """
+        Add a WHERE condition. Use `{}` as placeholder markers in *template*;
+        each `{}` is replaced with a new `$N` for the corresponding value.
+        """
+        parts: list[str] = []
+        tpl_parts = template.split("{}")
+        for i, part in enumerate(tpl_parts):
+            parts.append(part)
+            if i < len(values):
+                parts.append(self.add_param(values[i]))
+        self._conditions.append("".join(parts))
+        return self
+
+    def add_raw_condition(self, sql: str) -> "QueryBuilder":
+        """
+        Add a pre-built SQL condition string (no placeholder substitution).
+        Use this when you've already called add_param() to get placeholders.
+        """
+        self._conditions.append(sql)
+        return self
+
+    def where_sql(self, *, prefix: str = "WHERE ") -> str:
+        """Return the full WHERE string, or empty string if no conditions."""
+        if not self._conditions:
+            return ""
+        return prefix + " AND ".join(self._conditions)
+
+
+# ---------------------------------------------------------------------------
+# Helpers — metadata filters → SQL conditions
+# ---------------------------------------------------------------------------
+def _append_metadata_filters(
+    qb: QueryBuilder,
+    filters: dict[str, str],
+    metadata_field: str,
+) -> None:
+    """Add ``metadata->>'key' = value`` conditions for each filter entry."""
+    for key, value in filters.items():
+        key_ph = qb.add_param(key)
+        val_ph = qb.add_param(str(value))
+        qb.add_raw_condition(f"{metadata_field}->>{key_ph} = {val_ph}")
+
+
+def _metadata_matches_filters(metadata: dict[str, Any] | None, filters: dict[str, str] | None) -> bool:
+    """In-memory check that *metadata* satisfies every key=value in *filters*."""
+    if not filters:
+        return True
+    metadata = metadata or {}
+    return all(str(metadata.get(k)) == str(v) for k, v in filters.items())
+
+
+# ---------------------------------------------------------------------------
+# Helpers — scope resolution
+# ---------------------------------------------------------------------------
+def _candidate_scope_inputs(http_request: Request | None) -> list[str]:
+    """
+    Gather candidate scope strings from request headers based on configured
+    alias lists (workspace, cwd, repo_root, project).
+    """
+    if http_request is None:
+        return []
+
+    headers = http_request.headers
+    candidates: list[str] = []
+
+    alias_sources = (
+        settings.search.scope_header_workspace_aliases,
+        settings.search.scope_header_cwd_aliases,
+        settings.search.scope_header_repo_root_aliases,
+        settings.search.scope_header_project_aliases,
+    )
+    for alias_string in alias_sources:
+        for alias in alias_string.split(","):
+            alias = alias.strip()
+            if alias:
+                value = headers.get(alias)
+                if value:
+                    candidates.append(value)
+
+    return candidates
+
+
+def resolve_hidden_scope(
+    http_request: Request | None,
+) -> tuple[str | None, str | None]:
+    """
+    Resolve a hidden (repo_root, project_id) scope from request headers
+    using the project registry.  Returns (None, None) if disabled or
+    no match is found.
+    """
+    if not settings.search.scope_binding_enabled or http_request is None:
+        return None, None
+
+    registry = get_project_registry()
+    for candidate in _candidate_scope_inputs(http_request):
+        match = registry.find_project(candidate)
+        if match:
+            return match.project_root, match.project_id
+    return None, None
+
+
+def build_effective_filters(
+    request_filters: dict[str, str] | None,
+    hidden_repo_root: str | None,
+    hidden_project_id: str | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Merge user-supplied filters with hidden scope overrides.
+
+    Returns:
+        (effective_filters, scope_filters)
+    """
+    effective = dict(request_filters or {})
+
+    # Normalize legacy "project" key → "project_id"
+    if "project" in effective:
+        effective.setdefault("project_id", effective.pop("project"))
+
+    request_repo_root = effective.get("repo_root")
+    request_project_id = effective.get("project_id")
+
+    if hidden_repo_root:
+        effective["repo_root"] = hidden_repo_root
+    if hidden_project_id:
+        effective["project_id"] = hidden_project_id
+
+    scope: dict[str, str] = {}
+    repo_root = hidden_repo_root or request_repo_root
+    project_id = hidden_project_id or request_project_id
+    if repo_root:
+        scope["repo_root"] = repo_root
+    if project_id:
+        scope["project_id"] = project_id
+
+    return effective, scope
+
+
+# ---------------------------------------------------------------------------
+# Helpers — code-aware decoration
+# ---------------------------------------------------------------------------
+def _is_code_metadata(metadata: dict[str, Any] | None) -> bool:
+    return (metadata or {}).get("content_type") == "code"
+
+
+def _prepend_code_warning(text: str, metadata: dict[str, Any] | None) -> str:
+    if not settings.search.code_aware_enabled or not _is_code_metadata(metadata):
+        return text
+    warning = settings.search.code_result_warning.strip()
+    if warning and not text.startswith(warning):
+        return f"{warning}\n{text}"
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Helpers — embedding generation
+# ---------------------------------------------------------------------------
+async def _generate_query_embedding(query: str) -> list[float]:
+    """Generate a vector embedding for *query* via the configured service."""
+    return await embedding_service.generate_embedding(query)
+
+
+# ---------------------------------------------------------------------------
+# NEW: Query preprocessing — identifier token expansion for BMX+
+# ---------------------------------------------------------------------------
+def expand_identifier_tokens(query: str) -> str:
+    """
+    Expand camelCase, PascalCase, and snake_case identifiers into
+    constituent words ALONGSIDE the original token.
+
+    "parseConfigFile"             -> "parseConfigFile parse config file"
+    "handle_websocket_connection" -> "handle_websocket_connection handle websocket connection"
+    "XMLParser"                   -> "XMLParser xml parser"
+
+    The original token is preserved so BMX+ can still exact-match it.
+    Only used for BMX+ queries — do NOT apply to the embedding query,
+    the embedding model's tokenizer already handles subword splitting
+    internally.
+    """
+    tokens = query.split()
+    expanded = []
+
+    for token in tokens:
+        expanded.append(token)
+
+        # snake_case: split on underscores
+        if "_" in token:
+            parts = [p for p in token.split("_") if p]
+            if len(parts) > 1:
+                expanded.extend(p.lower() for p in parts)
+        # camelCase / PascalCase: split on lower→upper transitions
+        elif _HAS_CAMEL_RE.search(token):
+            parts = _CAMEL_SPLIT_RE.sub(r"\1 \2", token).split()
+            if len(parts) > 1:
+                expanded.extend(p.lower() for p in parts)
+        # ALLCAPS with transitions like "XMLParser" → "XML Parser"
+        elif _HAS_ALLCAPS_TRANSITION_RE.search(token):
+            parts = _ALLCAPS_SPLIT_RE.sub(r"\1 \2", token).split()
+            if len(parts) > 1:
+                expanded.extend(p.lower() for p in parts)
+
+    return " ".join(expanded)
+
+
+# ---------------------------------------------------------------------------
+# Helpers — score normalization
+# ---------------------------------------------------------------------------
+def _normalize_scores(scores: dict[str, float]) -> dict[str, float]:
+    """Min-max normalize a dict of scores to [0, 1].
+
+    If all scores are identical (or there's only one), they all map to 1.0.
+    This ensures both signals occupy the same dynamic range before fusion,
+    so the semantic_weight / bm25_weight ratio is meaningful regardless of
+    how the raw score distributions differ per query.
+    """
+    if not scores:
+        return {}
+    vals = list(scores.values())
+    lo, hi = min(vals), max(vals)
+    spread = hi - lo
+    if spread < 1e-9:
+        return {k: 1.0 for k in scores}
+    return {k: (v - lo) / spread for k, v in scores.items()}
+
+
+# ---------------------------------------------------------------------------
+# Helpers — BM25
+# ---------------------------------------------------------------------------
+def _invalidate_bm25(vector_store_id: str) -> None:
+    _bm25_cache.invalidate(vector_store_id)
+
+
+async def _get_or_build_bm25_index(
+    vector_store_id: str,
+    repo_root: str | None = None,
+    project_id: str | None = None,
+) -> tuple[BMXIndex, dict[str, dict[str, Any]]]:
+    """
+    Return a cached BM25 index for the given store+scope, building it from
+    the database if necessary.  Paginates reads to avoid OOM.
+    """
+    cached = _bm25_cache.get(vector_store_id, repo_root, project_id)
+    if cached is not None:
+        return cached.index, {}
+
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+
+    qb = QueryBuilder()
+    qb.add_condition(f"{fields.vector_store_id_field} = {{}}", vector_store_id)
+    if repo_root:
+        key_ph = qb.add_param("repo_root")
+        val_ph = qb.add_param(repo_root)
+        qb.add_raw_condition(f"{fields.metadata_field}->>{key_ph} = {val_ph}")
+    if project_id:
+        key_ph = qb.add_param("project_id")
+        val_ph = qb.add_param(project_id)
+        qb.add_raw_condition(f"{fields.metadata_field}->>{key_ph} = {val_ph}")
+
+    where_sql = qb.where_sql()
+    base_params = qb.params
+
+    chunks: list[dict[str, str]] = []
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    offset = 0
+
+    while True:
+        page_query = (
+            f"SELECT {fields.id_field}, {fields.content_field}, {fields.lexical_content_field} "
+            f"FROM {table_name} {where_sql} "
+            f"ORDER BY {fields.id_field} "
+            f"LIMIT {settings.search.bm25_page_size} OFFSET {offset}"
+        )
+        page_rows = await db.query_raw(page_query, *base_params)
+        if not page_rows:
+            break
+        fallback_rows = 0
+        for row in page_rows:
+            rows_by_id[row[fields.id_field]] = row
+            lexical_text = row.get(fields.lexical_content_field) or ""
+            text = lexical_text if lexical_text.strip() else row[fields.content_field]
+            if not text or not text.strip():
+                logger.warning("Row %s has no valid text for BMX; skipping", row[fields.id_field])
+                continue
+            chunks.append({
+                "chunk_id": row[fields.id_field],
+                "text": text,
+            })
+            if not lexical_text.strip():
+                fallback_rows += 1
+        if fallback_rows > 0:
+            logger.warning(
+                "Store %s contains pre-backfill rows; BMX falling back to content for %d rows",
+                vector_store_id, fallback_rows
+            )
+        if len(page_rows) < settings.search.bm25_page_size:
+            break
+        offset += settings.search.bm25_page_size
+
+    # CHANGED: BMXIndex now created with normalize_scores=True so scores
+    # are in [0, 1] — required for convex combination fusion and makes
+    # scores interpretable across queries and corpus sizes.
+    index = BMXIndex(normalize_scores=True)
+    index.build_index(chunks)
+    _bm25_cache.set(
+        vector_store_id, repo_root, project_id, BM25StoreState(index=index)
+    )
+    return index, rows_by_id
+
+
+def _coerce_bm25_result(result: Any) -> tuple[BMXIndex | None, dict[str, dict[str, Any]]]:
+    """Normalize BM25 helper responses to (index, rows_by_id)."""
+    if result is None:
+        return None, {}
+    if isinstance(result, tuple):
+        index = result[0]
+        rows_by_id = result[1] if len(result) > 1 and isinstance(result[1], dict) else {}
+        return index, rows_by_id
+    return result, {}
+
+
+# ---------------------------------------------------------------------------
+# Helpers — reranking
+# ---------------------------------------------------------------------------
+async def _rerank_candidates(
+    query: str,
+    candidates: list[dict[str, Any]],
+    content_field: str,
+    lexical_content_field: str,
+    top_n: int,
+) -> list[dict[str, Any]] | None:
+    """
+    Call the configured rerank endpoint.  Returns a re-ordered list of
+    candidate dicts with updated scores, or *None* on failure.
+    """
+    documents = []
+    for c in candidates:
+        lc = c["row"].get(lexical_content_field) or ""
+        doc_text = lc if lc.strip() else c["row"][content_field]
+        documents.append(doc_text)
+
+    rerank_max_attempts = settings.search.rerank_max_attempts
+    rerank_retry_delays = [float(x) for x in settings.search.rerank_retry_delays.split(",")]
+    for attempt in range(rerank_max_attempts):
+        try:
+            async with httpx.AsyncClient(timeout=settings.search.rerank_timeout) as client:
+                resp = await client.post(
+                    f"{settings.embedding.base_url.rstrip('/')}/rerank",
+                    headers={
+                        "Authorization": f"Bearer {settings.embedding.api_key}",
+                    },
+                    json={
+                        "model": settings.search.rerank_model,
+                        "query": query,
+                        "documents": documents,
+                        "top_n": top_n,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError):
+            if attempt < rerank_max_attempts - 1:
+                await asyncio.sleep(rerank_retry_delays[min(attempt, len(rerank_retry_delays) - 1)])
+                continue
+            logger.warning("Rerank failed after %d attempts", rerank_max_attempts)
+            return None
+        except Exception:
+            logger.exception("Unexpected rerank error")
+            return None
+
+        reranked: list[dict[str, Any]] = []
+        for item in data.get("results", []):
+            idx = item["index"]
+            candidate = dict(candidates[idx])  # shallow copy to avoid mutating original
+            candidate["rerank_score"] = item["relevance_score"]
+            reranked.append(candidate)
+        return reranked
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Helpers — vector store existence check
+# ---------------------------------------------------------------------------
+async def _assert_vector_store_exists(vector_store_id: str) -> None:
+    """Raise 404 if the vector store doesn't exist."""
+    table = settings.table_names["vector_stores"]
+    rows = await db.query_raw(
+        f"SELECT id FROM {table} WHERE id = $1", vector_store_id
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Vector store not found")
+
+
+# ---------------------------------------------------------------------------
+# Helpers — vector store stats update
+# ---------------------------------------------------------------------------
+async def _update_vector_store_stats(
+    vector_store_id: str,
+    added_count: int,
+    added_bytes: int,
+) -> None:
+    """Atomically bump completed/total file counts and usage_bytes."""
+    table = settings.table_names["vector_stores"]
+    default_fc = (
+        '{"in_progress": 0, "completed": 0, "failed": 0, '
+        '"cancelled": 0, "total": 0}'
+    )
+    await db.query_raw(
+        f"""
+        UPDATE {table}
+        SET
+            file_counts = jsonb_set(
+                jsonb_set(
+                    COALESCE(file_counts, '{default_fc}'::jsonb),
+                    '{{completed}}',
+                    (COALESCE(file_counts->>'completed', '0')::int + $2)::text::jsonb
+                ),
+                '{{total}}',
+                (COALESCE(file_counts->>'total', '0')::int + $2)::text::jsonb
+            ),
+            usage_bytes = COALESCE(usage_bytes, 0) + $3,
+            last_active_at = NOW()
+        WHERE id = $1
+        """,
+        vector_store_id,
+        added_count,
+        added_bytes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers — cursor resolution for pagination
+# ---------------------------------------------------------------------------
+async def _resolve_cursor(table: str, cursor_id: str) -> RowDict:
+    rows = await db.query_raw(
+        f"SELECT id, created_at FROM {table} WHERE id = $1", cursor_id
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Cursor not found")
+    return rows[0]  # type: ignore[no-any-return]
+
+
+# ---------------------------------------------------------------------------
+# Helpers — build responses from raw DB rows
+# ---------------------------------------------------------------------------
+def _vector_store_from_row(row: RowDict) -> VectorStoreResponse:
+    return VectorStoreResponse(
+        id=row["id"],
+        created_at=int(row["created_at_timestamp"]),
+        name=row["name"],
+        usage_bytes=row["usage_bytes"] or 0,
+        file_counts=row["file_counts"] or dict(DEFAULT_FILE_COUNTS),
+        status=row["status"],
+        expires_after=row["expires_after"],
+        expires_at=_to_unix_ts(row.get("expires_at")),
+        last_active_at=_to_unix_ts(row.get("last_active_at")),
+        metadata=row["metadata"],
+    )
+
+
+def _embedding_from_row(row: RowDict) -> EmbeddingResponse:
+    fields = settings.db_fields
+    return EmbeddingResponse(
+        id=row[fields.id_field],
+        vector_store_id=row[fields.vector_store_id_field],
+        content=row[fields.content_field],
+        metadata=row[fields.metadata_field],
+        created_at=int(row["created_at_timestamp"]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# NEW: Per-file cap for reranker diversity
+# ---------------------------------------------------------------------------
+def _cap_per_file(
+    candidates: list[dict[str, Any]],
+    metadata_field: str,
+    max_per_file: int = 3,
+) -> list[dict[str, Any]]:
+    """
+    Keep at most *max_per_file* chunks per source file going into the
+    reranker. Candidates must already be sorted best-first by fusion score.
+
+    This prevents one heavily-chunked file from monopolizing the reranker's
+    budget while still giving the reranker multiple chunks per file to
+    choose the best from. 3 is the sweet spot — covers the common
+    "signature chunk vs implementation chunk vs docstring chunk" splits.
+    """
+    file_counts: dict[str, int] = defaultdict(int)
+    capped: list[dict[str, Any]] = []
+
+    for c in candidates:
+        meta = c["row"].get(metadata_field) or {}
+        src = (
+            meta.get("doc_path")
+            or meta.get("source")
+            or meta.get("filename")
+            or ""
+        )
+        if file_counts[src] < max_per_file:
+            capped.append(c)
+            file_counts[src] += 1
+
+    return capped
+
+
+# ---------------------------------------------------------------------------
+# NEW: Post-rerank deduplication by source file
+# ---------------------------------------------------------------------------
+def _deduplicate_by_source_post_rerank(
+    candidates: list[dict[str, Any]],
+    metadata_field: str,
+) -> list[dict[str, Any]]:
+    """
+    After reranking, keep only the highest-scoring chunk per source file.
+    Candidates must already be sorted best-first by the reranker (or by
+    fusion score if reranking was skipped).
+
+    CHANGED: This replaces the old _deduplicate_by_source which ran BEFORE
+    reranking. Moving dedup after reranking lets the cross-encoder pick
+    the best chunk per file instead of relying on fusion scores to guess.
+    """
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+
+    for c in candidates:
+        meta = c["row"].get(metadata_field) or {}
+        src = (
+            meta.get("doc_path")
+            or meta.get("source")
+            or meta.get("filename")
+            or ""
+        )
+        if src not in seen:
+            seen.add(src)
+            deduped.append(c)
+
+    return deduped
+
+
+# ---------------------------------------------------------------------------
+# NEW: Convex Combination fusion (replaces RRF)
+# ---------------------------------------------------------------------------
+def _fuse_convex_combination(
+    semantic_candidates: list[dict[str, Any]],
+    bm25_results: list[tuple[str, float]],
+    bm25_only_rows: dict[str, RowDict],
+    semantic_weight: float,
+    bm25_weight: float,
+) -> list[dict[str, Any]]:
+    """
+    Convex Combination fusion with per-query score normalization.
+
+    Both input signals are min-max normalized to [0, 1] independently
+    before combining.  This compensates for the different raw score
+    distributions: semantic cosine similarities typically cluster in a
+    narrow band (0.55–0.75) while BMX+ scores spread across the full
+    range.  Without normalization, the signal with wider spread
+    dominates regardless of the configured weights.
+
+    combined_score = semantic_weight * norm_sem + bm25_weight * norm_bmx
+
+    Chunks appearing in only one signal get 0.0 for the missing signal
+    (after normalization of the present signal).
+    """
+    # Build raw score lookups
+    sem_by_id: dict[str, dict[str, Any]] = {}
+    raw_sem: dict[str, float] = {}
+    for c in semantic_candidates:
+        cid = c["chunk_id"]
+        sem_by_id[cid] = c
+        raw_sem[cid] = c["score"]
+
+    raw_bmx: dict[str, float] = {}
+    for cid, score in bm25_results:
+        raw_bmx[cid] = score
+
+    # Per-query min-max normalization
+    norm_sem = _normalize_scores(raw_sem)
+    norm_bmx = _normalize_scores(raw_bmx)
+
+    # Union of all chunk IDs from both signals
+    all_ids = set(raw_sem.keys()) | set(raw_bmx.keys())
+
+    fused: list[dict[str, Any]] = []
+    for cid in all_ids:
+        ns = norm_sem.get(cid, 0.0)
+        nb = norm_bmx.get(cid, 0.0)
+        combined = semantic_weight * ns + bm25_weight * nb
+
+        # Get the row data from whichever signal has it
+        if cid in sem_by_id:
+            row = sem_by_id[cid]["row"]
+        elif cid in bm25_only_rows:
+            row = bm25_only_rows[cid]
+        else:
+            continue  # no row data available — skip
+
+        fused.append({
+            "chunk_id": cid,
+            "row": row,
+            "score": combined,
+            "semantic_score": raw_sem.get(cid),
+            "bmx_score": raw_bmx.get(cid),
+        })
+
+    fused.sort(key=lambda x: x["score"], reverse=True)
+    return fused
+
+
+# ---------------------------------------------------------------------------
+# Module-level aliases (tests patch these by name on the module)
+# ---------------------------------------------------------------------------
+generate_query_embedding = _generate_query_embedding
+get_or_build_bm25_index_for_store = _get_or_build_bm25_index
+invalidate_bm25_index_for_store = _invalidate_bm25
+
+
+# ============================================================================
+# ROUTES
+# ============================================================================
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/vector_stores — create
+# ---------------------------------------------------------------------------
+@app.post("/v1/vector_stores", response_model=VectorStoreResponse)  # type: ignore[untyped-decorator]
+async def create_vector_store(
+    request: VectorStoreCreateRequest,
+    api_key: str = Depends(get_api_key),
+) -> VectorStoreResponse:
+    """Create a new vector store."""
+    table = settings.table_names["vector_stores"]
+
+    result = await db.query_raw(
+        f"""
+        INSERT INTO {table}
+            (id, name, file_counts, status, usage_bytes, expires_after, metadata, created_at)
+        VALUES
+            (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW())
+        RETURNING
+            id, name, file_counts, status, usage_bytes,
+            expires_after, expires_at, last_active_at, metadata,
+            EXTRACT(EPOCH FROM created_at)::bigint AS created_at_timestamp
+        """,
+        request.name,
+        DEFAULT_FILE_COUNTS,
+        "completed",
+        0,
+        request.expires_after,
+        request.metadata or {},
+    )
+
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to create vector store")
+
+    return _vector_store_from_row(result[0])
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/vector_stores — list
+# ---------------------------------------------------------------------------
+@app.get("/v1/vector_stores", response_model=VectorStoreListResponse)  # type: ignore[untyped-decorator]
+async def list_vector_stores(
+    limit: int | None = 20,
+    after: str | None = None,
+    before: str | None = None,
+    api_key: str = Depends(get_api_key),
+) -> VectorStoreListResponse:
+    """List vector stores with cursor-based pagination."""
+    table = settings.table_names["vector_stores"]
+    limit = min(limit or settings.search.default_limit, settings.search.max_limit)
+
+    qb = QueryBuilder()
+
+    if after:
+        cursor = await _resolve_cursor(table, after)
+        ca_ph = qb.add_param(cursor["created_at"])
+        id_ph = qb.add_param(cursor["id"])
+        qb.add_raw_condition(f"(created_at, id) < ({ca_ph}, {id_ph})")
+
+    if before:
+        cursor = await _resolve_cursor(table, before)
+        ca_ph = qb.add_param(cursor["created_at"])
+        id_ph = qb.add_param(cursor["id"])
+        qb.add_raw_condition(f"(created_at, id) > ({ca_ph}, {id_ph})")
+
+    where = qb.where_sql()
+    params = qb.params
+
+    query = (
+        f"SELECT id, name, file_counts, status, usage_bytes, "
+        f"expires_after, expires_at, last_active_at, metadata, "
+        f"EXTRACT(EPOCH FROM created_at)::bigint AS created_at_timestamp "
+        f"FROM {table} {where} "
+        f"ORDER BY created_at DESC, id DESC "
+        f"LIMIT {limit + 1}"
+    )
+    rows = await db.query_raw(query, *params)
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    stores = [_vector_store_from_row(r) for r in rows]
+    return VectorStoreListResponse(
+        data=stores,
+        first_id=stores[0].id if stores else None,
+        last_id=stores[-1].id if stores else None,
+        has_more=has_more,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/vector_stores/{id}/search — search
+# ---------------------------------------------------------------------------
+@app.post(  # type: ignore[untyped-decorator]
+    "/v1/vector_stores/{vector_store_id}/search",
+    response_model=VectorStoreSearchResponse,
+)
+@app.post(  # type: ignore[untyped-decorator]
+    "/vector_stores/{vector_store_id}/search",
+    response_model=VectorStoreSearchResponse,
+)
+async def search_vector_store(
+    vector_store_id: str,
+    request: VectorStoreSearchRequest,
+    api_key: str = Depends(get_api_key),
+    http_request: Request = None,
+) -> VectorStoreSearchResponse:
+    """
+    Semantic (+ optional hybrid BMX+) search over a vector store,
+    with optional reranking.
+
+    CHANGED in this overhaul:
+    - BMX+ queries get identifier token expansion (camelCase/snake_case splitting)
+    - Fusion switched from RRF to Convex Combination (preserves score magnitudes)
+    - Dedup moved from before reranking to after (reranker picks best chunk per file)
+    - Per-file cap (max 3) applied before reranking for diversity
+    - Score reporting fixed: always reports the score used for final ranking
+    """
+    await _assert_vector_store_exists(vector_store_id)
+
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+
+    # --- Scope & filters ---------------------------------------------------
+    hidden_repo_root, hidden_project = resolve_hidden_scope(http_request)
+    effective_filters, scope_filters = build_effective_filters(
+        request.filters, hidden_repo_root, hidden_project,
+    )
+
+    if (
+        settings.search.code_aware_enabled
+        and settings.search.scope_binding_enabled
+        and not scope_filters
+        and not settings.search.allow_unscoped_code_fallback
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Code-aware search requires hidden repo/project scope "
+                "when unscoped fallback is disabled"
+            ),
+        )
+
+    # --- Limits ------------------------------------------------------------
+    rerank_enabled = bool(settings.search.rerank_model)
+    hybrid_enabled = settings.search.hybrid_enabled and settings.search.hybrid_default
+    final_limit = min(
+        request.limit or settings.search.default_limit,
+        settings.search.max_limit,
+    )
+    fetch_limit = final_limit
+    if rerank_enabled:
+        fetch_limit = max(fetch_limit, settings.search.rerank_candidates)
+    if hybrid_enabled:
+        fetch_limit = max(fetch_limit, settings.search.bm25_candidates)
+
+    # --- Tiered symbol search (Tier 1 + Tier 2) ---------------------------
+    symbol_exact_results: list[dict[str, Any]] = []
+    symbol_fuzzy_results: list[dict[str, Any]] = []
+    project_id_for_symbols = scope_filters.get("project_id")
+
+    if (
+        settings.search.symbol_search_enabled
+        and project_id_for_symbols
+        and not request.lexical_only
+    ):
+        # Tier 1: exact symbol / parent / file match
+        symbol_exact_results = await search_symbols_exact(
+            db, project_id_for_symbols, request.query,
+        )
+
+        # Tier 2: fuzzy token match (only if Tier 1 didn't fully satisfy)
+        if len(symbol_exact_results) < final_limit:
+            symbol_fuzzy_results = await search_symbols_fuzzy(
+                db, project_id_for_symbols, request.query,
+                expand_fn=expand_identifier_tokens,
+            )
+
+    # --- Lexical-only shortcut (no embedding, no cosine, no rerank) --------
+    if request.lexical_only:
+        try:
+            bm25_index, _ = _coerce_bm25_result(
+                await get_or_build_bm25_index_for_store(
+                    vector_store_id,
+                    scope_filters.get("repo_root"),
+                    scope_filters.get("project_id"),
+                )
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"BM25 index build failed: {exc}",
+            )
+
+        # CHANGED: Apply identifier expansion for lexical-only path too
+        bmx_query = expand_identifier_tokens(request.query)
+        assert bm25_index is not None, "bm25_index must be set when lexical_only is True"
+        bm25_hits = bm25_index.search(bmx_query, top_k=final_limit)
+        if not bm25_hits:
+            return VectorStoreSearchResponse(
+                search_query=request.query, data=[], has_more=False,
+            )
+
+        hit_ids = [cid for cid, _ in bm25_hits]
+        id_list = ", ".join(f"'{cid}'" for cid in hit_ids)
+        fetched = await db.query_raw(
+            f"SELECT {fields.id_field}, {fields.content_field}, "
+            f"{fields.metadata_field}, {fields.semantic_content_field} "
+            f"FROM {table_name} "
+            f"WHERE {fields.id_field} IN ({id_list})"
+        )
+        rows_by_id = {r[fields.id_field]: r for r in fetched}
+
+        search_results: list[SearchResult] = []
+        for cid, score in bm25_hits:
+            row = rows_by_id.get(cid)
+            if not row:
+                continue
+            metadata = row[fields.metadata_field] or {}
+            filename = metadata.get("filename", metadata.get("source", "document.txt"))
+            text = row[fields.content_field]
+            if _is_code_metadata(metadata):
+                text = _prepend_code_warning(text, metadata)
+
+            raw_content_value = None
+            if request.return_raw_content:
+                sc = row.get(fields.semantic_content_field) or ""
+                raw_content_value = sc if sc.strip() else row[fields.content_field]
+
+            search_results.append(
+                SearchResult(
+                    file_id=cid,
+                    filename=filename,
+                    score=score,
+                    attributes=metadata if request.return_metadata else None,
+                    content=[ContentChunk(type="text", text=text)],
+                    raw_content=raw_content_value,
+                )
+            )
+
+        return VectorStoreSearchResponse(
+            search_query=request.query, data=search_results, has_more=False,
+        )
+
+    # --- Parallel: embedding generation + BM25 index build -----------------
+    async def _embed() -> list[float]:
+        return await generate_query_embedding(request.query)
+
+    async def _bm25() -> tuple[BMXIndex, RowDict] | None:
+        if not hybrid_enabled:
+            return None
+        try:
+            return await get_or_build_bm25_index_for_store(
+                vector_store_id,
+                scope_filters.get("repo_root"),
+                scope_filters.get("project_id"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "BM25 index build failed store=%s: %s", vector_store_id, exc
+            )
+            return None
+
+    query_embedding, bm25_result = await asyncio.gather(_embed(), _bm25())
+    bm25_index, bm25_rows_by_id = _coerce_bm25_result(bm25_result)
+
+    # --- Vector similarity query -------------------------------------------
+    query_vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
+
+    qb = QueryBuilder()
+    vec_ph = qb.add_param(query_vector_str)                         # $1 — for SELECT
+    qb.add_condition(                                                # $2 — WHERE
+        f"{fields.vector_store_id_field} = {{}}",
+        vector_store_id,
+    )
+
+    if effective_filters:
+        _append_metadata_filters(qb, effective_filters, fields.metadata_field)
+
+    where = qb.where_sql()
+    params = qb.params
+
+    sem_query = (
+        f"SELECT {fields.id_field}, {fields.content_field}, "
+        f"{fields.metadata_field}, {fields.semantic_content_field}, "
+        f"{fields.lexical_content_field}, "
+        f"({fields.embedding_field} {settings.search.operator} "
+        f"{vec_ph}::vector) AS distance "
+        f"FROM {table_name} {where} "
+        f"ORDER BY distance ASC LIMIT {fetch_limit}"
+    )
+    rows = await db.query_raw(sem_query, *params)
+
+    # Build semantic candidates (apply min_score filter)
+    semantic_candidates: list[dict[str, Any]] = []
+    for row in rows:
+        score = max(0.0, 1.0 - (row["distance"] / 2.0))
+        if score < settings.search.min_score:
+            continue
+        semantic_candidates.append({
+            "chunk_id": row[fields.id_field],
+            "row": row,
+            "score": score,
+        })
+
+    candidates = semantic_candidates
+    semantic_ids = {c["chunk_id"] for c in semantic_candidates}
+    semantic_by_id = {c["chunk_id"]: c for c in semantic_candidates}
+
+    # --- Merge symbol results (Tier 1+2) with hybrid (Tier 3) -------------
+    if symbol_exact_results or symbol_fuzzy_results:
+        candidates = merge_tiered_results(
+            symbol_exact_results,
+            symbol_fuzzy_results,
+            candidates,
+            limit=fetch_limit,
+        )
+
+    # --- Hybrid BMX+ merge -------------------------------------------------
+    if hybrid_enabled and bm25_index is not None:
+        try:
+            # CHANGED: Apply identifier expansion to BMX+ query only.
+            # The embedding query (above) uses the original query string —
+            # the embedding model's tokenizer handles subword splitting
+            # internally and adding extra tokens would pollute the
+            # semantic representation.
+            bmx_query = expand_identifier_tokens(request.query)
+            bm25_results = bm25_index.search(bmx_query, top_k=fetch_limit)
+
+            # Fetch rows for BM25-only hits
+            bm25_only_rows: dict[str, dict[str, Any]] = dict(bm25_rows_by_id)
+            bm25_only_ids = [
+                cid
+                for cid, _ in bm25_results
+                if cid not in semantic_ids and cid not in bm25_only_rows
+            ]
+            if bm25_only_ids:
+                id_list = ", ".join(f"'{cid}'" for cid in bm25_only_ids)
+                fetched = await db.query_raw(
+                    f"SELECT {fields.id_field}, {fields.content_field}, "
+                    f"{fields.metadata_field}, {fields.semantic_content_field}, "
+                    f"{fields.lexical_content_field} "
+                    f"FROM {table_name} "
+                    f"WHERE {fields.id_field} IN ({id_list})"
+                )
+                bm25_only_rows.update({r[fields.id_field]: r for r in fetched})
+
+            # Filter BM25 results by metadata
+            if effective_filters:
+                bm25_results = [
+                    (cid, score)
+                    for cid, score in bm25_results
+                    if _metadata_matches_filters(
+                        (
+                            semantic_by_id[cid]["row"]
+                            if cid in semantic_ids
+                            else bm25_only_rows.get(cid, {})
+                        ).get(fields.metadata_field),
+                        effective_filters,
+                    )
+                ]
+
+            # CHANGED: Convex Combination fusion instead of RRF.
+            # CC preserves score magnitude info — a 0.95 semantic hit
+            # fused with a 0.10 BMX+ hit gets a very different combined
+            # score than a 0.95 + 0.90, whereas RRF would treat both
+            # the same if they happened to share the same rank positions.
+            if bm25_results:
+                candidates = _fuse_convex_combination(
+                    semantic_candidates=semantic_candidates,
+                    bm25_results=bm25_results,
+                    bm25_only_rows=bm25_only_rows,
+                    semantic_weight=settings.search.semantic_weight,
+                    bm25_weight=settings.search.bm25_weight,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Hybrid merge failed store=%s: %s", vector_store_id, exc
+            )
+
+    # --- CHANGED: Per-file cap BEFORE reranking, dedup AFTER ---------------
+    # Old flow: dedup by file → rerank → return
+    # New flow: cap 3 per file → rerank → dedup by file → return
+    #
+    # Why: The old flow picked one chunk per file using fusion scores,
+    # then the reranker only ever saw that one chunk. If fusion picked
+    # the wrong chunk from a file (e.g. the imports instead of the
+    # function body), the reranker never got a chance to fix it.
+    #
+    # Now the reranker sees up to 3 chunks per file and picks the best
+    # one, then we dedup to keep just the winner per file.
+    candidates = _cap_per_file(candidates, fields.metadata_field, max_per_file=3)
+
+    # --- Reranking ---------------------------------------------------------
+    if rerank_enabled and candidates:
+        rerank_pool = candidates[:settings.search.rerank_candidates]
+        reranked = await _rerank_candidates(
+            request.query, rerank_pool, fields.content_field, fields.lexical_content_field,
+            min(settings.search.rerank_top_n, len(rerank_pool)),
+        )
+        if reranked is not None:
+            candidates = reranked
+        else:
+            logger.info("Reranking failed; falling back to fusion order")
+            candidates = candidates[:final_limit]
+    else:
+        candidates = candidates[:final_limit]
+
+    # --- CHANGED: Dedup by file AFTER reranking ----------------------------
+    candidates = _deduplicate_by_source_post_rerank(candidates, fields.metadata_field)
+    candidates = candidates[:final_limit]
+
+    # --- Build response ----------------------------------------------------
+    results_out: list[SearchResult] = []
+    unscoped_code = False
+
+    for c in candidates:
+        row = c["row"]
+        metadata = row[fields.metadata_field] or {}
+        filename = metadata.get("filename", metadata.get("source", "document.txt"))
+
+        # Use display text from metadata if available, otherwise fall back to stored content
+        text = str(metadata.get("text_display", row[fields.content_field]))
+
+        if _is_code_metadata(metadata):
+            text = _prepend_code_warning(text, metadata)
+            if settings.search.scope_binding_enabled and not scope_filters:
+                unscoped_code = True
+
+        # Score reporting fix — always report the score that
+        # actually determined the final ranking order.
+        if c.get("rerank_score") is not None:
+            reported_score = c["rerank_score"]
+        else:
+            reported_score = c["score"]
+
+        # Raw content: return semantic text when requested
+        raw_content_value = None
+        if request.return_raw_content:
+            sc = row.get(fields.semantic_content_field) or ""
+            raw_content_value = sc if sc.strip() else row[fields.content_field]
+
+        results_out.append(
+            SearchResult(
+                file_id=row[fields.id_field],
+                filename=filename,
+                score=reported_score,
+                attributes=metadata if request.return_metadata else None,
+                content=[ContentChunk(type="text", text=text)],
+                raw_content=raw_content_value,
+            )
+        )
+
+    if unscoped_code and settings.search.allow_unscoped_code_fallback:
+        logger.warning(
+            "Returning unscoped code results for store=%s", vector_store_id
+        )
+
+    return VectorStoreSearchResponse(
+        search_query=request.query,
+        data=results_out,
+        has_more=False,
+        next_page=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/vector_stores/{id}/embeddings — single create
+# ---------------------------------------------------------------------------
+@app.post(  # type: ignore[untyped-decorator]
+    "/v1/vector_stores/{vector_store_id}/embeddings",
+    response_model=EmbeddingResponse,
+    name="create_embedding",
+)
+async def create_embedding(
+    vector_store_id: str,
+    request: EmbeddingCreateRequest,
+    api_key: str = Depends(get_api_key),
+) -> EmbeddingResponse:
+    """Add a single embedding to a vector store."""
+    await _assert_vector_store_exists(vector_store_id)
+
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+    vec_str = "[" + ",".join(map(str, request.embedding)) + "]"
+
+    result = await db.query_raw(
+        f"""
+        INSERT INTO {table_name}
+            ({fields.id_field}, {fields.vector_store_id_field},
+             {fields.content_field}, {fields.semantic_content_field},
+             {fields.lexical_content_field}, {fields.embedding_field},
+             {fields.metadata_field}, {fields.created_at_field})
+        VALUES (gen_random_uuid(), $1, $2, $3, $4, $5::vector, $6, NOW())
+        RETURNING
+            {fields.id_field}, {fields.vector_store_id_field},
+            {fields.content_field}, {fields.metadata_field},
+            EXTRACT(EPOCH FROM {fields.created_at_field})::bigint
+                AS created_at_timestamp
+        """,
+        vector_store_id,
+        request.content,
+        request.semantic_content or request.content,
+        request.lexical_content or request.content,
+        vec_str,
+        request.metadata or {},
+    )
+
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to create embedding")
+
+    await _update_vector_store_stats(vector_store_id, 1, len(request.content))
+    invalidate_bm25_index_for_store(vector_store_id)
+
+    # Insert symbol record if chunk has symbol metadata
+    symbol_rec = build_symbol_record(result[0][fields.id_field], request.metadata or {})
+    if symbol_rec:
+        try:
+            await insert_symbol_records(db, [symbol_rec])
+        except Exception:
+            logger.warning("Symbol record insert failed for %s", result[0][fields.id_field], exc_info=True)
+
+    return _embedding_from_row(result[0])
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/vector_stores/{id}/embeddings/batch — batch create
+# ---------------------------------------------------------------------------
+@app.post(  # type: ignore[untyped-decorator]
+    "/v1/vector_stores/{vector_store_id}/embeddings/batch",
+    response_model=EmbeddingBatchCreateResponse,
+)
+async def create_embeddings_batch(
+    vector_store_id: str,
+    request: EmbeddingBatchCreateRequest,
+    api_key: str = Depends(get_api_key),
+) -> EmbeddingBatchCreateResponse:
+    """Add multiple embeddings to a vector store in one batch."""
+    await _assert_vector_store_exists(vector_store_id)
+
+    if not request.embeddings:
+        raise HTTPException(status_code=400, detail="No embeddings provided")
+
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+
+    # Build batch VALUES
+    values_parts: list[str] = []
+    params: list[Any] = []
+    pc = 1
+    for emb in request.embeddings:
+        vec_str = "[" + ",".join(map(str, emb.embedding)) + "]"
+        values_parts.append(
+            f"(gen_random_uuid(), ${pc}, ${pc+1}, ${pc+2}, ${pc+3}, ${pc+4}::vector, ${pc+5}, NOW())"
+        )
+        params.extend([
+            vector_store_id,
+            emb.content,
+            emb.semantic_content or emb.content,
+            emb.lexical_content or emb.content,
+            vec_str,
+            emb.metadata or {},
+        ])
+        pc += 6
+
+    result = await db.query_raw(
+        f"""
+        INSERT INTO {table_name}
+            ({fields.id_field}, {fields.vector_store_id_field},
+             {fields.content_field}, {fields.semantic_content_field},
+             {fields.lexical_content_field}, {fields.embedding_field},
+             {fields.metadata_field}, {fields.created_at_field})
+        VALUES {', '.join(values_parts)}
+        RETURNING
+            {fields.id_field}, {fields.vector_store_id_field},
+            {fields.content_field}, {fields.metadata_field},
+            EXTRACT(EPOCH FROM {fields.created_at_field})::bigint
+                AS created_at_timestamp
+        """,
+        *params,
+    )
+
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to create embeddings")
+
+    total_bytes = sum(len(e.content) for e in request.embeddings)
+    await _update_vector_store_stats(
+        vector_store_id, len(request.embeddings), total_bytes
+    )
+    invalidate_bm25_index_for_store(vector_store_id)
+
+    # Batch-insert symbol records for chunks with symbol metadata
+    symbol_recs = []
+    for r in result:
+        rec = build_symbol_record(r[fields.id_field], r[fields.metadata_field] or {})
+        if rec:
+            symbol_recs.append(rec)
+    if symbol_recs:
+        try:
+            await insert_symbol_records(db, symbol_recs)
+        except Exception:
+            logger.warning("Symbol batch insert failed", exc_info=True)
+
+    return EmbeddingBatchCreateResponse(
+        data=[_embedding_from_row(r) for r in result],
+        created=int(time.time()),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/vector_stores/{id}/sources
+# ---------------------------------------------------------------------------
+@app.get(  # type: ignore[untyped-decorator]
+    "/v1/vector_stores/{vector_store_id}/sources",
+    response_model=VectorStoreSourcesResponse,
+)
+async def list_vector_store_sources(
+    vector_store_id: str,
+    project_id: str | None = None,
+    api_key: str = Depends(get_api_key),
+) -> VectorStoreSourcesResponse:
+    """List all doc_path → content_hash pairs in a vector store."""
+    await _assert_vector_store_exists(vector_store_id)
+
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+
+    qb = QueryBuilder()
+    qb.add_condition(f"{fields.vector_store_id_field} = {{}}", vector_store_id)
+
+    if project_id:
+        pid_key_ph = qb.add_param("project_id")
+        pid_val_ph = qb.add_param(project_id)
+        qb.add_raw_condition(
+            f"{fields.metadata_field}->>{pid_key_ph} = {pid_val_ph}"
+        )
+
+    qb.add_raw_condition(f"{fields.metadata_field}->>'doc_path' IS NOT NULL")
+    where = qb.where_sql()
+
+    rows = await db.query_raw(
+        f"""
+        SELECT
+            {fields.metadata_field}->>'doc_path' AS doc_path,
+            MAX({fields.metadata_field}->>'content_hash') AS content_hash,
+            COUNT(*) AS chunk_count,
+            MAX(({fields.metadata_field}->>'chunk_chars')::int) AS max_chunk_chars
+        FROM {table_name}
+        {where}
+        GROUP BY {fields.metadata_field}->>'doc_path'
+        """,
+        *qb.params,
+    )
+
+    sources = {
+        row["doc_path"]: {
+            "content_hash": row["content_hash"],
+            "chunk_count": row["chunk_count"],
+            "max_chunk_chars": row["max_chunk_chars"],
+        }
+        for row in rows
+    }
+    return VectorStoreSourcesResponse(
+        vector_store_id=vector_store_id, sources=sources
+    )
+
+
+# ---------------------------------------------------------------------------
+# DELETE /v1/vector_stores/{id}/embeddings
+# ---------------------------------------------------------------------------
+@app.delete(  # type: ignore[untyped-decorator]
+    "/v1/vector_stores/{vector_store_id}/embeddings",
+    response_model=DeleteEmbeddingsResponse,
+    name="delete_embeddings",
+)
+async def delete_embeddings(
+    vector_store_id: str,
+    doc_path: str | None = None,
+    project_id: str | None = None,
+    api_key: str = Depends(get_api_key),
+) -> DeleteEmbeddingsResponse:
+    """Delete embeddings matching the given metadata filters."""
+    if not doc_path and not project_id:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one filter (doc_path or project_id) is required",
+        )
+
+    await _assert_vector_store_exists(vector_store_id)
+
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+
+    qb = QueryBuilder()
+    qb.add_condition(f"{fields.vector_store_id_field} = {{}}", vector_store_id)
+
+    if doc_path:
+        dp_key_ph = qb.add_param("doc_path")
+        dp_val_ph = qb.add_param(doc_path)
+        qb.add_raw_condition(
+            f"{fields.metadata_field}->>{dp_key_ph} = {dp_val_ph}"
+        )
+    if project_id:
+        pid_key_ph = qb.add_param("project_id")
+        pid_val_ph = qb.add_param(project_id)
+        qb.add_raw_condition(
+            f"{fields.metadata_field}->>{pid_key_ph} = {pid_val_ph}"
+        )
+
+    where = qb.where_sql()
+    result = await db.query_raw(
+        f"DELETE FROM {table_name} {where} RETURNING {fields.id_field}",
+        *qb.params,
+    )
+
+    invalidate_bm25_index_for_store(vector_store_id)
+
+    # Clean up symbol records for deleted chunks
+    deleted_ids = [r[fields.id_field] for r in result]
+    if deleted_ids:
+        try:
+            await delete_symbol_records(db, chunk_ids=deleted_ids)
+        except Exception:
+            logger.warning("Symbol record cleanup failed", exc_info=True)
+
+    return DeleteEmbeddingsResponse(
+        vector_store_id=vector_store_id, deleted=len(result)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+@app.get("/health")  # type: ignore[untyped-decorator]
+async def health_check() -> dict[str, str | int]:
+    """Health check — includes a DB ping."""
+    db_ok = True
+    try:
+        await db.query_raw("SELECT 1")
+    except Exception:
+        db_ok = False
+
+    status = "healthy" if db_ok else "degraded"
+    return {
+        "status": status,
+        "timestamp": int(time.time()),
+        "database": "connected" if db_ok else "unreachable",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host=settings.host, port=settings.port, reload=True)
+
+
+================================================================================
+
+[ COMPRESSED 70%  →  budget 42,245 chars  |  actual 70%  |  42,269 chars  |  988 lines ]
+================================================================================
+"""
+OpenAI-compatible Vector Stores API using PGVector.
+This module provides the FastAPI application with endpoints for creating,
+listing, and searching vector stores, as well as managing embeddings.
+"""
+import asyncio
+import logging
+import math
+import re
+import time
+import uuid
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any
+from collections.abc import AsyncIterator
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from prisma import Prisma  # type: ignore[attr-defined]
+from dotenv import load_dotenv
+from models import (
+    ContentChunk,
+    DeleteEmbeddingsResponse,
+    EmbeddingBatchCreateRequest,
+    EmbeddingBatchCreateResponse,
+    EmbeddingCreateRequest,
+    EmbeddingResponse,
+    SearchResult,
+    VectorStoreCreateRequest,
+    VectorStoreListResponse,
+    VectorStoreResponse,
+    VectorStoreSearchRequest,
+    VectorStoreSearchResponse,
+    VectorStoreSourcesResponse,
+)
+from config import settings
+from embedding_service import embedding_service
+from project_registry import ProjectRegistry
+from retrieval_bmx import BMXIndex
+from retrieval_hybrid import BM25StoreCache, BM25StoreState
+from symbol_table import (
+    build_symbol_record,
+    delete_symbol_records,
+    insert_symbol_records,
+    merge_tiered_results,
+    search_symbols_exact,
+    search_symbols_fuzzy,
+)
+load_dotenv()
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+DEFAULT_FILE_COUNTS = {
+    "in_progress": 0,
+    "completed": 0,
+    "failed": 0,
+    "cancelled": 0,
+    "total": 0,
+}
+DEFAULT_CORS_ALLOW_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+# ---------------------------------------------------------------------------
+# Regex for identifier splitting (compiled once at module level)
+# ---------------------------------------------------------------------------
+_CAMEL_SPLIT_RE = re.compile(r"([a-z])([A-Z])")
+_ALLCAPS_SPLIT_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_HAS_CAMEL_RE = re.compile(r"[a-z][A-Z]")
+_HAS_ALLCAPS_TRANSITION_RE = re.compile(r"[A-Z]{2,}[a-z]")
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+db = Prisma()
+# ---------------------------------------------------------------------------
+# Singletons / Caches
+# ---------------------------------------------------------------------------
+_bm25_cache = BM25StoreCache()  # type: ignore[no-untyped-call]
+_project_registry: ProjectRegistry | None = None
+def get_project_registry() -> ProjectRegistry:
+    """Lazy-load and cache the project registry from disk."""
+    global _project_registry
+    if _project_registry is None:
+        _project_registry = ProjectRegistry.load(settings.ragconfig_path)
+    return _project_registry
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Connect to DB on startup, disconnect on shutdown."""
+    await db.connect()
+    logger.info("Database connected")
+    yield
+    await db.disconnect()
+    logger.info("Database disconnected")
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="OpenAI Vector Stores API",
+    description="OpenAI-compatible Vector Stores API using PGVector",
+    version="2.1.0",  # CHANGED: bumped version for this overhaul
+    lifespan=lifespan,
+)
+cors_allow_origins = [
+    origin.strip()
+    for origin in settings.cors_allow_origins.split(",")
+    if origin.strip()
+]
+cors_allow_origin_regex = settings.cors_allow_origin_regex.strip() or None
+if not cors_allow_origins and cors_allow_origin_regex is None:
+    cors_allow_origins = DEFAULT_CORS_ALLOW_ORIGINS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_allow_origins,
+    allow_origin_regex=cors_allow_origin_regex,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+security = HTTPBearer()
+# ---------------------------------------------------------------------------
+# Middleware — request ID + error handling
+# ---------------------------------------------------------------------------
+@app.middleware("http")  # type: ignore[untyped-decorator]
+async def request_context_middleware(request: Request, call_next: Any) -> Response:
+    """Attach a unique request ID and handle uncaught exceptions uniformly."""
+    request_id = request.headers.get("X-Request-ID", uuid.uuid4().hex[:12])
+    request.state.request_id = request_id
+    try:
+        response: Response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception:
+        logger.warning("Unhandled exception [request_id=%s]", request_id, exc_info=True)
+        raise
+# ---------------------------------------------------------------------------
+# Type alias for untyped dicts returned from the DB
+# ---------------------------------------------------------------------------
+RowDict = dict[str, Any]
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+async def get_api_key(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> str:
+    """Validate the Bearer token against the configured server API key."""
+    if credentials.credentials != settings.server_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return credentials.credentials  # type: ignore[no-any-return]
+# ---------------------------------------------------------------------------
+# Helpers — time conversion
+# ---------------------------------------------------------------------------
+def _to_unix_ts(val: Any) -> int | None:
+    """Convert a datetime, ISO-8601 string, or None → Unix timestamp int."""
+    if val is None:
+        return None
+    if hasattr(val, "timestamp"):
+        return int(val.timestamp())
+    try:
+        dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return None
+# ---------------------------------------------------------------------------
+# Helpers — SQL query builder
+# ---------------------------------------------------------------------------
+class QueryBuilder:
+    """
+    Lightweight helper to build parameterized SQL without manual $N counting.
+    Usage:
+        qb = QueryBuilder()
+        qb.add_condition("name = {}", "Alice")
+        ph = qb.add_param(some_value)
+        qb.add_raw_condition(f"col = {ph}")
+        where = qb.where_sql()
+        params = qb.params
+    """
+    def __init__(self, *, start_param: int = 1) -> None:
+        self._conditions: list[str] = []
+        self._params: list[Any] = []
+        self._counter = start_param
+    @property
+    def param_count(self) -> int:
+        return self._counter
+    @property
+    def params(self) -> list[Any]:
+        return list(self._params)
+    def add_param(self, value: Any) -> str:
+        """Register a parameter and return its $N placeholder."""
+        ph = f"${self._counter}"
+        self._counter += 1
+        self._params.append(value)
+        return ph
+    def add_condition(self, template: str, *values: Any) -> "QueryBuilder":
+        """
+        Add a WHERE condition. Use `{}` as placeholder markers in *template*;
+        each `{}` is replaced with a new `$N` for the corresponding value.
+        """
+        parts: list[str] = []
+        tpl_parts = template.split("{}")
+        for i, part in enumerate(tpl_parts):
+            parts.append(part)
+            if i < len(values):
+                parts.append(self.add_param(values[i]))
+        self._conditions.append("".join(parts))
+        return self
+    def add_raw_condition(self, sql: str) -> "QueryBuilder":
+        """
+        Add a pre-built SQL condition string (no placeholder substitution).
+        Use this when you've already called add_param() to get placeholders.
+        """
+        self._conditions.append(sql)
+        return self
+    def where_sql(self, *, prefix: str = "WHERE ") -> str:
+        """Return the full WHERE string, or empty string if no conditions."""
+        if not self._conditions:
+            return ""
+        return prefix + " AND ".join(self._conditions)
+# ---------------------------------------------------------------------------
+# Helpers — metadata filters → SQL conditions
+# ---------------------------------------------------------------------------
+def _append_metadata_filters(
+    qb: QueryBuilder,
+    filters: dict[str, str],
+    metadata_field: str,
+) -> None:
+    """Add ``metadata->>'key' = value`` conditions for each filter entry."""
+    for key, value in filters.items():
+        key_ph = qb.add_param(key)
+        val_ph = qb.add_param(str(value))
+        qb.add_raw_condition(f"{metadata_field}->>{key_ph} = {val_ph}")
+def _metadata_matches_filters(metadata: dict[str, Any] | None, filters: dict[str, str] | None) -> bool:
+    """In-memory check that *metadata* satisfies every key=value in *filters*."""
+    if not filters:
+        return True
+    metadata = metadata or {}
+    return all(str(metadata.get(k)) == str(v) for k, v in filters.items())
+# ---------------------------------------------------------------------------
+# Helpers — scope resolution
+# ---------------------------------------------------------------------------
+def _candidate_scope_inputs(http_request: Request | None) -> list[str]:
+    """
+    Gather candidate scope strings from request headers based on configured
+    alias lists (workspace, cwd, repo_root, project).
+    """
+    if http_request is None:
+        return []
+    headers = http_request.headers
+    candidates: list[str] = []
+    alias_sources = (
+        settings.search.scope_header_workspace_aliases,
+        settings.search.scope_header_cwd_aliases,
+        settings.search.scope_header_repo_root_aliases,
+        settings.search.scope_header_project_aliases,
+    )
+    for alias_string in alias_sources:
+        for alias in alias_string.split(","):
+            alias = alias.strip()
+            if alias:
+                value = headers.get(alias)
+                if value:
+                    candidates.append(value)
+    return candidates
+def resolve_hidden_scope(
+    http_request: Request | None,
+) -> tuple[str | None, str | None]:
+    """
+    Resolve a hidden (repo_root, project_id) scope from request headers
+    using the project registry.  Returns (None, None) if disabled or
+    no match is found.
+    """
+    if not settings.search.scope_binding_enabled or http_request is None:
+        return None, None
+    registry = get_project_registry()
+    for candidate in _candidate_scope_inputs(http_request):
+        match = registry.find_project(candidate)
+        if match:
+            return match.project_root, match.project_id
+    return None, None
+def build_effective_filters(
+    request_filters: dict[str, str] | None,
+    hidden_repo_root: str | None,
+    hidden_project_id: str | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Merge user-supplied filters with hidden scope overrides.
+    Returns:
+        (effective_filters, scope_filters)
+    """
+    effective = dict(request_filters or {})
+    # Normalize legacy "project" key → "project_id"
+    if "project" in effective:
+        effective.setdefault("project_id", effective.pop("project"))
+    request_repo_root = effective.get("repo_root")
+    request_project_id = effective.get("project_id")
+    if hidden_repo_root:
+        effective["repo_root"] = hidden_repo_root
+    if hidden_project_id:
+        effective["project_id"] = hidden_project_id
+    scope: dict[str, str] = {}
+    repo_root = hidden_repo_root or request_repo_root
+    project_id = hidden_project_id or request_project_id
+    if repo_root:
+        scope["repo_root"] = repo_root
+    if project_id:
+        scope["project_id"] = project_id
+    return effective, scope
+# ---------------------------------------------------------------------------
+# Helpers — code-aware decoration
+# ---------------------------------------------------------------------------
+def _is_code_metadata(metadata: dict[str, Any] | None) -> bool:
+    return (metadata or {}).get("content_type") == "code"
+def _prepend_code_warning(text: str, metadata: dict[str, Any] | None) -> str:
+    if not settings.search.code_aware_enabled or not _is_code_metadata(metadata):
+        return text
+    warning = settings.search.code_result_warning.strip()
+    if warning and not text.startswith(warning):
+        return f"{warning}\n{text}"
+    return text
+# ---------------------------------------------------------------------------
+# Helpers — embedding generation
+# ---------------------------------------------------------------------------
+async def _generate_query_embedding(query: str) -> list[float]:
+    """Generate a vector embedding for *query* via the configured service."""
+    return await embedding_service.generate_embedding(query)
+# ---------------------------------------------------------------------------
+# NEW: Query preprocessing — identifier token expansion for BMX+
+# ---------------------------------------------------------------------------
+def expand_identifier_tokens(query: str) -> str:
+    """
+    Expand camelCase, PascalCase, and snake_case identifiers into
+    constituent words ALONGSIDE the original token.
+    "parseConfigFile"             -> "parseConfigFile parse config file"
+    "handle_websocket_connection" -> "handle_websocket_connection handle websocket connection"
+    "XMLParser"                   -> "XMLParser xml parser"
+    The original token is preserved so BMX+ can still exact-match it.
+    Only used for BMX+ queries — do NOT apply to the embedding query,
+    the embedding model's tokenizer already handles subword splitting
+    internally.
+    """
+    tokens = query.split()
+    expanded = []
+    for token in tokens:
+        expanded.append(token)
+        # snake_case: split on underscores
+        if "_" in token:
+            parts = [p for p in token.split("_") if p]
+            if len(parts) > 1:
+                expanded.extend(p.lower() for p in parts)
+        # camelCase / PascalCase: split on lower→upper transitions
+        elif _HAS_CAMEL_RE.search(token):
+            parts = _CAMEL_SPLIT_RE.sub(r"\1 \2", token).split()
+            if len(parts) > 1:
+                expanded.extend(p.lower() for p in parts)
+        # ALLCAPS with transitions like "XMLParser" → "XML Parser"
+        elif _HAS_ALLCAPS_TRANSITION_RE.search(token):
+            parts = _ALLCAPS_SPLIT_RE.sub(r"\1 \2", token).split()
+            if len(parts) > 1:
+                expanded.extend(p.lower() for p in parts)
+    return " ".join(expanded)
+# ---------------------------------------------------------------------------
+# Helpers — score normalization
+# ---------------------------------------------------------------------------
+def _normalize_scores(scores: dict[str, float]) -> dict[str, float]:
+    """Min-max normalize a dict of scores to [0, 1].
+    If all scores are identical (or there's only one), they all map to 1.0.
+    This ensures both signals occupy the same dynamic range before fusion,
+    so the semantic_weight / bm25_weight ratio is meaningful regardless of
+    how the raw score distributions differ per query.
+    """
+    if not scores:
+        return {}
+    vals = list(scores.values())
+    lo, hi = min(vals), max(vals)
+    spread = hi - lo
+    if spread < 1e-9:
+        return {k: 1.0 for k in scores}
+    return {k: (v - lo) / spread for k, v in scores.items()}
+# ---------------------------------------------------------------------------
+# Helpers — BM25
+# ---------------------------------------------------------------------------
+def _invalidate_bm25(vector_store_id: str) -> None:
+    _bm25_cache.invalidate(vector_store_id)
+async def _get_or_build_bm25_index(
+    vector_store_id: str,
+    repo_root: str | None = None,
+    project_id: str | None = None,
+) -> tuple[BMXIndex, dict[str, dict[str, Any]]]:
+    """
+    Return a cached BM25 index for the given store+scope, building it from
+    the database if necessary.  Paginates reads to avoid OOM.
+    """
+    cached = _bm25_cache.get(vector_store_id, repo_root, project_id)
+    if cached is not None:
+        return cached.index, {}
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+    qb = QueryBuilder()
+    qb.add_condition(f"{fields.vector_store_id_field} = {{}}", vector_store_id)
+    if repo_root:
+        key_ph = qb.add_param("repo_root")
+        val_ph = qb.add_param(repo_root)
+        qb.add_raw_condition(f"{fields.metadata_field}->>{key_ph} = {val_ph}")
+    if project_id:
+        key_ph = qb.add_param("project_id")
+        val_ph = qb.add_param(project_id)
+        qb.add_raw_condition(f"{fields.metadata_field}->>{key_ph} = {val_ph}")
+    where_sql = qb.where_sql()
+    base_params = qb.params
+    chunks: list[dict[str, str]] = []
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    offset = 0
+    while True:
+        page_query = (
+            f"SELECT {fields.id_field}, {fields.content_field}, {fields.lexical_content_field} "
+            f"FROM {table_name} {where_sql} "
+            f"ORDER BY {fields.id_field} "
+            f"LIMIT {settings.search.bm25_page_size} OFFSET {offset}"
+        )
+        page_rows = await db.query_raw(page_query, *base_params)
+        if not page_rows:
+            break
+        fallback_rows = 0
+        for row in page_rows:
+            rows_by_id[row[fields.id_field]] = row
+            lexical_text = row.get(fields.lexical_content_field) or ""
+            text = lexical_text if lexical_text.strip() else row[fields.content_field]
+            if not text or not text.strip():
+                logger.warning("Row %s has no valid text for BMX; skipping", row[fields.id_field])
+                continue
+            chunks.append({
+                "chunk_id": row[fields.id_field],
+                "text": text,
+            })
+            if not lexical_text.strip():
+                fallback_rows += 1
+        if fallback_rows > 0:
+            logger.warning(
+                "Store %s contains pre-backfill rows; BMX falling back to content for %d rows",
+                vector_store_id, fallback_rows
+            )
+        if len(page_rows) < settings.search.bm25_page_size:
+            break
+        offset += settings.search.bm25_page_size
+    # CHANGED: BMXIndex now created with normalize_scores=True so scores
+    # are in [0, 1] — required for convex combination fusion and makes
+    # scores interpretable across queries and corpus sizes.
+    index = BMXIndex(normalize_scores=True)
+    index.build_index(chunks)
+    _bm25_cache.set(
+        vector_store_id, repo_root, project_id, BM25StoreState(index=index)
+    )
+    return index, rows_by_id
+def _coerce_bm25_result(result: Any) -> tuple[BMXIndex | None, dict[str, dict[str, Any]]]:
+    """Normalize BM25 helper responses to (index, rows_by_id)."""
+    if result is None:
+        return None, {}
+    if isinstance(result, tuple):
+        index = result[0]
+        rows_by_id = result[1] if len(result) > 1 and isinstance(result[1], dict) else {}
+        return index, rows_by_id
+    return result, {}
+# ---------------------------------------------------------------------------
+# Helpers — reranking
+# ---------------------------------------------------------------------------
+async def _rerank_candidates(
+    query: str,
+    candidates: list[dict[str, Any]],
+    content_field: str,
+    lexical_content_field: str,
+    top_n: int,
+) -> list[dict[str, Any]] | None:
+    """
+    Call the configured rerank endpoint.  Returns a re-ordered list of
+    candidate dicts with updated scores, or *None* on failure.
+    """
+    documents = []
+    for c in candidates:
+        lc = c["row"].get(lexical_content_field) or ""
+        doc_text = lc if lc.strip() else c["row"][content_field]
+        documents.append(doc_text)
+    rerank_max_attempts = settings.search.rerank_max_attempts
+    rerank_retry_delays = [float(x) for x in settings.search.rerank_retry_delays.split(",")]
+    for attempt in range(rerank_max_attempts):
+        try:
+            async with httpx.AsyncClient(timeout=settings.search.rerank_timeout) as client:
+                resp = await client.post(
+                    f"{settings.embedding.base_url.rstrip('/')}/rerank",
+                    headers={
+                        "Authorization": f"Bearer {settings.embedding.api_key}",
+                    },
+                    json={
+                        "model": settings.search.rerank_model,
+                        "query": query,
+                        "documents": documents,
+                        "top_n": top_n,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError):
+            if attempt < rerank_max_attempts - 1:
+                await asyncio.sleep(rerank_retry_delays[min(attempt, len(rerank_retry_delays) - 1)])
+                continue
+            logger.warning("Rerank failed after %d attempts", rerank_max_attempts)
+            return None
+        except Exception:
+            logger.exception("Unexpected rerank error")
+            return None
+        reranked: list[dict[str, Any]] = []
+        for item in data.get("results", []):
+            idx = item["index"]
+            candidate = dict(candidates[idx])  # shallow copy to avoid mutating original
+            candidate["rerank_score"] = item["relevance_score"]
+            reranked.append(candidate)
+        return reranked
+    return None
+# ---------------------------------------------------------------------------
+# Helpers — vector store existence check
+# ---------------------------------------------------------------------------
+async def _assert_vector_store_exists(vector_store_id: str) -> None:
+    """Raise 404 if the vector store doesn't exist."""
+    table = settings.table_names["vector_stores"]
+    rows = await db.query_raw(
+        f"SELECT id FROM {table} WHERE id = $1", vector_store_id
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Vector store not found")
+# ---------------------------------------------------------------------------
+# Helpers — vector store stats update
+# ---------------------------------------------------------------------------
+async def _update_vector_store_stats(
+    vector_store_id: str,
+    added_count: int,
+    added_bytes: int,
+) -> None:
+    """Atomically bump completed/total file counts and usage_bytes."""
+    table = settings.table_names["vector_stores"]
+    default_fc = (
+        '{"in_progress": 0, "completed": 0, "failed": 0, '
+        '"cancelled": 0, "total": 0}'
+    )
+    await db.query_raw(
+        f"""
+        UPDATE {table}
+        SET
+            file_counts = jsonb_set(
+                jsonb_set(
+                    COALESCE(file_counts, '{default_fc}'::jsonb),
+                    '{{completed}}',
+                    (COALESCE(file_counts->>'completed', '0')::int + $2)::text::jsonb
+                ),
+                '{{total}}',
+                (COALESCE(file_counts->>'total', '0')::int + $2)::text::jsonb
+            ),
+            usage_bytes = COALESCE(usage_bytes, 0) + $3,
+            last_active_at = NOW()
+        WHERE id = $1
+        """,
+        vector_store_id,
+        added_count,
+        added_bytes,
+    )
+# ---------------------------------------------------------------------------
+# Helpers — cursor resolution for pagination
+# ---------------------------------------------------------------------------
+async def _resolve_cursor(table: str, cursor_id: str) -> RowDict:
+    rows = await db.query_raw(
+        f"SELECT id, created_at FROM {table} WHERE id = $1", cursor_id
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Cursor not found")
+    return rows[0]  # type: ignore[no-any-return]
+# ---------------------------------------------------------------------------
+# Helpers — build responses from raw DB rows
+# ---------------------------------------------------------------------------
+def _vector_store_from_row(row: RowDict) -> VectorStoreResponse:
+    return VectorStoreResponse(
+        id=row["id"],
+        created_at=int(row["created_at_timestamp"]),
+        name=row["name"],
+        usage_bytes=row["usage_bytes"] or 0,
+        file_counts=row["file_counts"] or dict(DEFAULT_FILE_COUNTS),
+        status=row["status"],
+        expires_after=row["expires_after"],
+        expires_at=_to_unix_ts(row.get("expires_at")),
+        last_active_at=_to_unix_ts(row.get("last_active_at")),
+        metadata=row["metadata"],
+    )
+def _embedding_from_row(row: RowDict) -> EmbeddingResponse:
+    fields = settings.db_fields
+    return EmbeddingResponse(
+        id=row[fields.id_field],
+        vector_store_id=row[fields.vector_store_id_field],
+        content=row[fields.content_field],
+        metadata=row[fields.metadata_field],
+        created_at=int(row["created_at_timestamp"]),
+    )
+# ---------------------------------------------------------------------------
+# NEW: Per-file cap for reranker diversity
+# ---------------------------------------------------------------------------
+def _cap_per_file(
+    candidates: list[dict[str, Any]],
+    metadata_field: str,
+    max_per_file: int = 3,
+) -> list[dict[str, Any]]:
+    """
+    Keep at most *max_per_file* chunks per source file going into the
+    reranker. Candidates must already be sorted best-first by fusion score.
+    This prevents one heavily-chunked file from monopolizing the reranker's
+    budget while still giving the reranker multiple chunks per file to
+    choose the best from. 3 is the sweet spot — covers the common
+    "signature chunk vs implementation chunk vs docstring chunk" splits.
+    """
+    file_counts: dict[str, int] = defaultdict(int)
+    capped: list[dict[str, Any]] = []
+    for c in candidates:
+        meta = c["row"].get(metadata_field) or {}
+        src = (
+            meta.get("doc_path")
+            or meta.get("source")
+            or meta.get("filename")
+            or ""
+        )
+        if file_counts[src] < max_per_file:
+            capped.append(c)
+            file_counts[src] += 1
+    return capped
+# ---------------------------------------------------------------------------
+# NEW: Post-rerank deduplication by source file
+# ---------------------------------------------------------------------------
+def _deduplicate_by_source_post_rerank(
+    candidates: list[dict[str, Any]],
+    metadata_field: str,
+) -> list[dict[str, Any]]:
+    """
+    After reranking, keep only the highest-scoring chunk per source file.
+    Candidates must already be sorted best-first by the reranker (or by
+    fusion score if reranking was skipped).
+    CHANGED: This replaces the old _deduplicate_by_source which ran BEFORE
+    reranking. Moving dedup after reranking lets the cross-encoder pick
+    the best chunk per file instead of relying on fusion scores to guess.
+    """
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for c in candidates:
+        meta = c["row"].get(metadata_field) or {}
+        src = (
+            meta.get("doc_path")
+            or meta.get("source")
+            or meta.get("filename")
+            or ""
+        )
+        if src not in seen:
+            seen.add(src)
+            deduped.append(c)
+    return deduped
+# ---------------------------------------------------------------------------
+# NEW: Convex Combination fusion (replaces RRF)
+# ---------------------------------------------------------------------------
+def _fuse_convex_combination(
+    semantic_candidates: list[dict[str, Any]],
+    bm25_results: list[tuple[str, float]],
+    bm25_only_rows: dict[str, RowDict],
+    semantic_weight: float,
+    bm25_weight: float,
+) -> list[dict[str, Any]]:
+    """
+    Convex Combination fusion with per-query score normalization.
+    Both input signals are min-max normalized to [0, 1] independently
+    before combining.  This compensates for the different raw score
+    distributions: semantic cosine similarities typically cluster in a
+    narrow band (0.55–0.75) while BMX+ scores spread across the full
+    range.  Without normalization, the signal with wider spread
+    dominates regardless of the configured weights.
+    combined_score = semantic_weight * norm_sem + bm25_weight * norm_bmx
+    Chunks appearing in only one signal get 0.0 for the missing signal
+    (after normalization of the present signal).
+    """
+    # Build raw score lookups
+    sem_by_id: dict[str, dict[str, Any]] = {}
+    raw_sem: dict[str, float] = {}
+    for c in semantic_candidates:
+        cid = c["chunk_id"]
+        sem_by_id[cid] = c
+        raw_sem[cid] = c["score"]
+    raw_bmx: dict[str, float] = {}
+    for cid, score in bm25_results:
+        raw_bmx[cid] = score
+    # Per-query min-max normalization
+    norm_sem = _normalize_scores(raw_sem)
+    norm_bmx = _normalize_scores(raw_bmx)
+    # Union of all chunk IDs from both signals
+    all_ids = set(raw_sem.keys()) | set(raw_bmx.keys())
+    fused: list[dict[str, Any]] = []
+    for cid in all_ids:
+        ns = norm_sem.get(cid, 0.0)
+        nb = norm_bmx.get(cid, 0.0)
+        combined = semantic_weight * ns + bm25_weight * nb
+        # Get the row data from whichever signal has it
+        if cid in sem_by_id:
+            row = sem_by_id[cid]["row"]
+        elif cid in bm25_only_rows:
+            row = bm25_only_rows[cid]
+        else:
+            continue  # no row data available — skip
+        fused.append({
+            "chunk_id": cid,
+            "row": row,
+            "score": combined,
+            "semantic_score": raw_sem.get(cid),
+            "bmx_score": raw_bmx.get(cid),
+        })
+    fused.sort(key=lambda x: x["score"], reverse=True)
+    return fused
+# ---------------------------------------------------------------------------
+# Module-level aliases (tests patch these by name on the module)
+# ---------------------------------------------------------------------------
+generate_query_embedding = _generate_query_embedding
+get_or_build_bm25_index_for_store = _get_or_build_bm25_index
+invalidate_bm25_index_for_store = _invalidate_bm25
+# ============================================================================
+# ROUTES
+# ============================================================================
+# ---------------------------------------------------------------------------
+# POST /v1/vector_stores — create
+# ---------------------------------------------------------------------------
+@app.post("/v1/vector_stores", response_model=VectorStoreResponse)  # type: ignore[untyped-decorator]
+async def create_vector_store(
+    request: VectorStoreCreateRequest,
+    api_key: str = Depends(get_api_key),
+) -> VectorStoreResponse:
+    """Create a new vector store."""
+    table = settings.table_names["vector_stores"]
+    result = await db.query_raw(
+        f"""
+        INSERT INTO {table}
+            (id, name, file_counts, status, usage_bytes, expires_after, metadata, created_at)
+        VALUES
+            (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW())
+        RETURNING
+            id, name, file_counts, status, usage_bytes,
+            expires_after, expires_at, last_active_at, metadata,
+            EXTRACT(EPOCH FROM created_at)::bigint AS created_at_timestamp
+        """,
+        request.name,
+        DEFAULT_FILE_COUNTS,
+        "completed",
+        0,
+        request.expires_after,
+        request.metadata or {},
+    )
+    if not result:
+    return _vector_store_from_row(result[0])
+# ---------------------------------------------------------------------------
+# GET /v1/vector_stores — list
+# ---------------------------------------------------------------------------
+@app.get("/v1/vector_stores", response_model=VectorStoreListResponse)  # type: ignore[untyped-decorator]
+async def list_vector_stores(
+    limit: int | None = 20,
+    after: str | None = None,
+    before: str | None = None,
+    api_key: str = Depends(get_api_key),
+) -> VectorStoreListResponse:
+    """List vector stores with cursor-based pagination."""
+    table = settings.table_names["vector_stores"]
+    limit = min(limit or settings.search.default_limit, settings.search.max_limit)
+    qb = QueryBuilder()
+    if after:
+        cursor = await _resolve_cursor(table, after)
+        ca_ph = qb.add_param(cursor["created_at"])
+        id_ph = qb.add_param(cursor["id"])
+        qb.add_raw_condition(f"(created_at, id) < ({ca_ph}, {id_ph})")
+    if before:
+        cursor = await _resolve_cursor(table, before)
+        ca_ph = qb.add_param(cursor["created_at"])
+        id_ph = qb.add_param(cursor["id"])
+        qb.add_raw_condition(f"(created_at, id) > ({ca_ph}, {id_ph})")
+    where = qb.where_sql()
+    params = qb.params
+    query = (
+        f"SELECT id, name, file_counts, status, usage_bytes, "
+        f"expires_after, expires_at, last_active_at, metadata, "
+        f"EXTRACT(EPOCH FROM created_at)::bigint AS created_at_timestamp "
+        f"FROM {table} {where} "
+        f"ORDER BY created_at DESC, id DESC "
+        f"LIMIT {limit + 1}"
+    )
+    rows = await db.query_raw(query, *params)
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    stores = [_vector_store_from_row(r) for r in rows]
+    return VectorStoreListResponse(
+        data=stores,
+        first_id=stores[0].id if stores else None,
+        last_id=stores[-1].id if stores else None,
+        has_more=has_more,
+    )
+# ---------------------------------------------------------------------------
+# POST /v1/vector_stores/{id}/search — search
+# ---------------------------------------------------------------------------
+@app.post(  # type: ignore[untyped-decorator]
+    "/v1/vector_stores/{vector_store_id}/search",
+    response_model=VectorStoreSearchResponse,
+)
+@app.post(  # type: ignore[untyped-decorator]
+    "/vector_stores/{vector_store_id}/search",
+    response_model=VectorStoreSearchResponse,
+)
+async def search_vector_store(
+    vector_store_id: str,
+    request: VectorStoreSearchRequest,
+    api_key: str = Depends(get_api_key),
+    http_request: Request = None,
+) -> VectorStoreSearchResponse:
+    """
+    Semantic (+ optional hybrid BMX+) search over a vector store,
+    with optional reranking.
+    CHANGED in this overhaul:
+    - BMX+ queries get identifier token expansion (camelCase/snake_case splitting)
+    - Fusion switched from RRF to Convex Combination (preserves score magnitudes)
+    - Dedup moved from before reranking to after (reranker picks best chunk per file)
+    - Per-file cap (max 3) applied before reranking for diversity
+    - Score reporting fixed: always reports the score used for final ranking
+    """
+    await _assert_vector_store_exists(vector_store_id)
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+    # --- Scope & filters ---------------------------------------------------
+    hidden_repo_root, hidden_project = resolve_hidden_scope(http_request)
+    effective_filters, scope_filters = build_effective_filters(
+        request.filters, hidden_repo_root, hidden_project,
+    )
+    if (
+        settings.search.code_aware_enabled
+        and settings.search.scope_binding_enabled
+        and not scope_filters
+        and not settings.search.allow_unscoped_code_fallback
+    ):
+            status_code=400,
+            detail=(
+                "Code-aware search requires hidden repo/project scope "
+                "when unscoped fallback is disabled"
+            ),
+        )
+    # --- Limits ------------------------------------------------------------
+    rerank_enabled = bool(settings.search.rerank_model)
+    hybrid_enabled = settings.search.hybrid_enabled and settings.search.hybrid_default
+    final_limit = min(
+        request.limit or settings.search.default_limit,
+        settings.search.max_limit,
+    )
+    fetch_limit = final_limit
+    if rerank_enabled:
+        fetch_limit = max(fetch_limit, settings.search.rerank_candidates)
+    if hybrid_enabled:
+        fetch_limit = max(fetch_limit, settings.search.bm25_candidates)
+    # --- Tiered symbol search (Tier 1 + Tier 2) ---------------------------
+    symbol_exact_results: list[dict[str, Any]] = []
+    symbol_fuzzy_results: list[dict[str, Any]] = []
+    project_id_for_symbols = scope_filters.get("project_id")
+    if (
+        settings.search.symbol_search_enabled
+        and project_id_for_symbols
+        and not request.lexical_only
+    ):
+        # Tier 1: exact symbol / parent / file match
+        symbol_exact_results = await search_symbols_exact(
+            db, project_id_for_symbols, request.query,
+        )
+        # Tier 2: fuzzy token match (only if Tier 1 didn't fully satisfy)
+        if len(symbol_exact_results) < final_limit:
+            symbol_fuzzy_results = await search_symbols_fuzzy(
+                db, project_id_for_symbols, request.query,
+                expand_fn=expand_identifier_tokens,
+            )
+    # --- Lexical-only shortcut (no embedding, no cosine, no rerank) --------
+    if request.lexical_only:
+        try:
+            bm25_index, _ = _coerce_bm25_result(
+                await get_or_build_bm25_index_for_store(
+                    vector_store_id,
+                    scope_filters.get("repo_root"),
+                    scope_filters.get("project_id"),
+                )
+            )
+                status_code=500,
+                detail=f"BM25 index build failed: {exc}",
+            )
+        # CHANGED: Apply identifier expansion for lexical-only path too
+        bmx_query = expand_identifier_tokens(request.query)
+        assert bm25_index is not None, "bm25_index must be set when lexical_only is True"
+        bm25_hits = bm25_index.search(bmx_query, top_k=final_limit)
+        if not bm25_hits:
+            return VectorStoreSearchResponse(
+                search_query=request.query, data=[], has_more=False,
+            )
+        hit_ids = [cid for cid, _ in bm25_hits]
+        id_list = ", ".join(f"'{cid}'" for cid in hit_ids)
+        fetched = await db.query_raw(
+            f"SELECT {fields.id_field}, {fields.content_field}, "
+            f"{fields.metadata_field}, {fields.semantic_content_field} "
+            f"FROM {table_name} "
+            f"WHERE {fields.id_field} IN ({id_list})"
+        )
+        rows_by_id = {r[fields.id_field]: r for r in fetched}
+        search_results: list[SearchResult] = []
+        for cid, score in bm25_hits:
+            row = rows_by_id.get(cid)
+            if not row:
+                continue
+            metadata = row[fields.metadata_field] or {}
+            filename = metadata.get("filename", metadata.get("source", "document.txt"))
+            text = row[fields.content_field]
+            if _is_code_metadata(metadata):
+                text = _prepend_code_warning(text, metadata)
+            raw_content_value = None
+            if request.return_raw_content:
+                sc = row.get(fields.semantic_content_field) or ""
+                raw_content_value = sc if sc.strip() else row[fields.content_field]
+            search_results.append(
+                SearchResult(
+                    file_id=cid,
+                    filename=filename,
+                    score=score,
+                    attributes=metadata if request.return_metadata else None,
+                    content=[ContentChunk(type="text", text=text)],
+                    raw_content=raw_content_value,
+                )
+            )
+        return VectorStoreSearchResponse(
+            search_query=request.query, data=search_results, has_more=False,
+        )
+    # --- Parallel: embedding generation + BM25 index build -----------------
+    async def _embed() -> list[float]:
+        return await generate_query_embedding(request.query)
+    async def _bm25() -> tuple[BMXIndex, RowDict] | None:
+        if not hybrid_enabled:
+            return None
+        try:
+            return await get_or_build_bm25_index_for_store(
+                vector_store_id,
+                scope_filters.get("repo_root"),
+                scope_filters.get("project_id"),
+            )
+            logger.warning(
+                "BM25 index build failed store=%s: %s", vector_store_id, exc
+            )
+            return None
+    query_embedding, bm25_result = await asyncio.gather(_embed(), _bm25())
+    bm25_index, bm25_rows_by_id = _coerce_bm25_result(bm25_result)
+    # --- Vector similarity query -------------------------------------------
+    query_vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
+    qb = QueryBuilder()
+    vec_ph = qb.add_param(query_vector_str)                         # $1 — for SELECT
+    qb.add_condition(                                                # $2 — WHERE
+        f"{fields.vector_store_id_field} = {{}}",
+        vector_store_id,
+    )
+    if effective_filters:
+        _append_metadata_filters(qb, effective_filters, fields.metadata_field)
+    where = qb.where_sql()
+    params = qb.params
+    sem_query = (
+        f"SELECT {fields.id_field}, {fields.content_field}, "
+        f"{fields.metadata_field}, {fields.semantic_content_field}, "
+        f"{fields.lexical_content_field}, "
+        f"({fields.embedding_field} {settings.search.operator} "
+        f"{vec_ph}::vector) AS distance "
+        f"FROM {table_name} {where} "
+        f"ORDER BY distance ASC LIMIT {fetch_limit}"
+    )
+    for row in rows:
+        })
+    #
+... [635 frames omitted]
+================================================================================
+
+[ COMPRESSED 50%  →  budget 30,175 chars  |  actual 50%  |  30,199 chars  |  713 lines ]
+================================================================================
+"""
+OpenAI-compatible Vector Stores API using PGVector.
+This module provides the FastAPI application with endpoints for creating,
+listing, and searching vector stores, as well as managing embeddings.
+"""
+import asyncio
+import logging
+import math
+import re
+import time
+import uuid
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any
+from collections.abc import AsyncIterator
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from prisma import Prisma  # type: ignore[attr-defined]
+from dotenv import load_dotenv
+from models import (
+    ContentChunk,
+    DeleteEmbeddingsResponse,
+    EmbeddingBatchCreateRequest,
+    EmbeddingBatchCreateResponse,
+    EmbeddingCreateRequest,
+    EmbeddingResponse,
+    SearchResult,
+    VectorStoreCreateRequest,
+    VectorStoreListResponse,
+    VectorStoreResponse,
+    VectorStoreSearchRequest,
+    VectorStoreSearchResponse,
+    VectorStoreSourcesResponse,
+)
+from config import settings
+from embedding_service import embedding_service
+from project_registry import ProjectRegistry
+from retrieval_bmx import BMXIndex
+from retrieval_hybrid import BM25StoreCache, BM25StoreState
+from symbol_table import (
+    build_symbol_record,
+    delete_symbol_records,
+    insert_symbol_records,
+    merge_tiered_results,
+    search_symbols_exact,
+    search_symbols_fuzzy,
+)
+load_dotenv()
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+DEFAULT_FILE_COUNTS = {
+    "in_progress": 0,
+    "completed": 0,
+    "failed": 0,
+    "cancelled": 0,
+    "total": 0,
+}
+DEFAULT_CORS_ALLOW_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+# ---------------------------------------------------------------------------
+# Regex for identifier splitting (compiled once at module level)
+# ---------------------------------------------------------------------------
+_CAMEL_SPLIT_RE = re.compile(r"([a-z])([A-Z])")
+_ALLCAPS_SPLIT_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_HAS_CAMEL_RE = re.compile(r"[a-z][A-Z]")
+_HAS_ALLCAPS_TRANSITION_RE = re.compile(r"[A-Z]{2,}[a-z]")
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+db = Prisma()
+# ---------------------------------------------------------------------------
+# Singletons / Caches
+# ---------------------------------------------------------------------------
+_bm25_cache = BM25StoreCache()  # type: ignore[no-untyped-call]
+_project_registry: ProjectRegistry | None = None
+def get_project_registry() -> ProjectRegistry:
+    """Lazy-load and cache the project registry from disk."""
+    global _project_registry
+    if _project_registry is None:
+        _project_registry = ProjectRegistry.load(settings.ragconfig_path)
+    return _project_registry
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Connect to DB on startup, disconnect on shutdown."""
+    await db.connect()
+    logger.info("Database connected")
+    yield
+    await db.disconnect()
+    logger.info("Database disconnected")
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="OpenAI Vector Stores API",
+    description="OpenAI-compatible Vector Stores API using PGVector",
+    version="2.1.0",  # CHANGED: bumped version for this overhaul
+    lifespan=lifespan,
+)
+cors_allow_origins = [
+    origin.strip()
+    for origin in settings.cors_allow_origins.split(",")
+    if origin.strip()
+]
+cors_allow_origin_regex = settings.cors_allow_origin_regex.strip() or None
+if not cors_allow_origins and cors_allow_origin_regex is None:
+    cors_allow_origins = DEFAULT_CORS_ALLOW_ORIGINS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_allow_origins,
+    allow_origin_regex=cors_allow_origin_regex,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+security = HTTPBearer()
+# ---------------------------------------------------------------------------
+# Middleware — request ID + error handling
+# ---------------------------------------------------------------------------
+@app.middleware("http")  # type: ignore[untyped-decorator]
+async def request_context_middleware(request: Request, call_next: Any) -> Response:
+    """Attach a unique request ID and handle uncaught exceptions uniformly."""
+    request_id = request.headers.get("X-Request-ID", uuid.uuid4().hex[:12])
+    request.state.request_id = request_id
+    try:
+        response: Response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception:
+        logger.warning("Unhandled exception [request_id=%s]", request_id, exc_info=True)
+        raise
+# ---------------------------------------------------------------------------
+# Type alias for untyped dicts returned from the DB
+# ---------------------------------------------------------------------------
+RowDict = dict[str, Any]
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+async def get_api_key(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> str:
+    """Validate the Bearer token against the configured server API key."""
+    if credentials.credentials != settings.server_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return credentials.credentials  # type: ignore[no-any-return]
+# ---------------------------------------------------------------------------
+# Helpers — time conversion
+# ---------------------------------------------------------------------------
+def _to_unix_ts(val: Any) -> int | None:
+    """Convert a datetime, ISO-8601 string, or None → Unix timestamp int."""
+    if val is None:
+        return None
+    if hasattr(val, "timestamp"):
+        return int(val.timestamp())
+    try:
+        dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return None
+# ---------------------------------------------------------------------------
+# Helpers — SQL query builder
+# ---------------------------------------------------------------------------
+class QueryBuilder:
+    """
+    Lightweight helper to build parameterized SQL without manual $N counting.
+    Usage:
+        qb = QueryBuilder()
+        qb.add_condition("name = {}", "Alice")
+        ph = qb.add_param(some_value)
+        qb.add_raw_condition(f"col = {ph}")
+        where = qb.where_sql()
+        params = qb.params
+    """
+    def __init__(self, *, start_param: int = 1) -> None:
+        self._conditions: list[str] = []
+        self._params: list[Any] = []
+        self._counter = start_param
+    @property
+    def param_count(self) -> int:
+        return self._counter
+    @property
+    def params(self) -> list[Any]:
+        return list(self._params)
+    def add_param(self, value: Any) -> str:
+        """Register a parameter and return its $N placeholder."""
+        ph = f"${self._counter}"
+        self._counter += 1
+        self._params.append(value)
+        return ph
+    def add_condition(self, template: str, *values: Any) -> "QueryBuilder":
+        """
+        Add a WHERE condition. Use `{}` as placeholder markers in *template*;
+        each `{}` is replaced with a new `$N` for the corresponding value.
+        """
+        parts: list[str] = []
+        tpl_parts = template.split("{}")
+        for i, part in enumerate(tpl_parts):
+            parts.append(part)
+            if i < len(values):
+                parts.append(self.add_param(values[i]))
+        self._conditions.append("".join(parts))
+        return self
+    def add_raw_condition(self, sql: str) -> "QueryBuilder":
+        """
+        Add a pre-built SQL condition string (no placeholder substitution).
+        Use this when you've already called add_param() to get placeholders.
+        """
+        self._conditions.append(sql)
+        return self
+    def where_sql(self, *, prefix: str = "WHERE ") -> str:
+        """Return the full WHERE string, or empty string if no conditions."""
+        if not self._conditions:
+            return ""
+        return prefix + " AND ".join(self._conditions)
+# ---------------------------------------------------------------------------
+# Helpers — metadata filters → SQL conditions
+# ---------------------------------------------------------------------------
+def _append_metadata_filters(
+    qb: QueryBuilder,
+    filters: dict[str, str],
+    metadata_field: str,
+) -> None:
+    """Add ``metadata->>'key' = value`` conditions for each filter entry."""
+    for key, value in filters.items():
+        key_ph = qb.add_param(key)
+        val_ph = qb.add_param(str(value))
+        qb.add_raw_condition(f"{metadata_field}->>{key_ph} = {val_ph}")
+def _metadata_matches_filters(metadata: dict[str, Any] | None, filters: dict[str, str] | None) -> bool:
+    """In-memory check that *metadata* satisfies every key=value in *filters*."""
+    if not filters:
+        return True
+    metadata = metadata or {}
+    return all(str(metadata.get(k)) == str(v) for k, v in filters.items())
+# ---------------------------------------------------------------------------
+# Helpers — scope resolution
+# ---------------------------------------------------------------------------
+def _candidate_scope_inputs(http_request: Request | None) -> list[str]:
+    """
+    Gather candidate scope strings from request headers based on configured
+    alias lists (workspace, cwd, repo_root, project).
+    """
+    if http_request is None:
+        return []
+    headers = http_request.headers
+    candidates: list[str] = []
+    alias_sources = (
+        settings.search.scope_header_workspace_aliases,
+        settings.search.scope_header_cwd_aliases,
+        settings.search.scope_header_repo_root_aliases,
+        settings.search.scope_header_project_aliases,
+    )
+    for alias_string in alias_sources:
+        for alias in alias_string.split(","):
+            alias = alias.strip()
+            if alias:
+                value = headers.get(alias)
+                if value:
+                    candidates.append(value)
+    return candidates
+def resolve_hidden_scope(
+    http_request: Request | None,
+) -> tuple[str | None, str | None]:
+    """
+    Resolve a hidden (repo_root, project_id) scope from request headers
+    using the project registry.  Returns (None, None) if disabled or
+    no match is found.
+    """
+    if not settings.search.scope_binding_enabled or http_request is None:
+        return None, None
+    registry = get_project_registry()
+    for candidate in _candidate_scope_inputs(http_request):
+        match = registry.find_project(candidate)
+        if match:
+            return match.project_root, match.project_id
+    return None, None
+def build_effective_filters(
+    request_filters: dict[str, str] | None,
+    hidden_repo_root: str | None,
+    hidden_project_id: str | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Merge user-supplied filters with hidden scope overrides.
+    Returns:
+        (effective_filters, scope_filters)
+    """
+    effective = dict(request_filters or {})
+    # Normalize legacy "project" key → "project_id"
+    if "project" in effective:
+        effective.setdefault("project_id", effective.pop("project"))
+    request_repo_root = effective.get("repo_root")
+    request_project_id = effective.get("project_id")
+    if hidden_repo_root:
+        effective["repo_root"] = hidden_repo_root
+    if hidden_project_id:
+        effective["project_id"] = hidden_project_id
+    scope: dict[str, str] = {}
+    repo_root = hidden_repo_root or request_repo_root
+    project_id = hidden_project_id or request_project_id
+    if repo_root:
+        scope["repo_root"] = repo_root
+    if project_id:
+        scope["project_id"] = project_id
+    return effective, scope
+# ---------------------------------------------------------------------------
+# Helpers — code-aware decoration
+# ---------------------------------------------------------------------------
+def _is_code_metadata(metadata: dict[str, Any] | None) -> bool:
+    return (metadata or {}).get("content_type") == "code"
+def _prepend_code_warning(text: str, metadata: dict[str, Any] | None) -> str:
+    if not settings.search.code_aware_enabled or not _is_code_metadata(metadata):
+        return text
+    warning = settings.search.code_result_warning.strip()
+    if warning and not text.startswith(warning):
+        return f"{warning}\n{text}"
+    return text
+# ---------------------------------------------------------------------------
+# Helpers — embedding generation
+# ---------------------------------------------------------------------------
+async def _generate_query_embedding(query: str) -> list[float]:
+    """Generate a vector embedding for *query* via the configured service."""
+    return await embedding_service.generate_embedding(query)
+# ---------------------------------------------------------------------------
+# NEW: Query preprocessing — identifier token expansion for BMX+
+# ---------------------------------------------------------------------------
+def expand_identifier_tokens(query: str) -> str:
+    """
+    Expand camelCase, PascalCase, and snake_case identifiers into
+    constituent words ALONGSIDE the original token.
+    "parseConfigFile"             -> "parseConfigFile parse config file"
+    "handle_websocket_connection" -> "handle_websocket_connection handle websocket connection"
+    "XMLParser"                   -> "XMLParser xml parser"
+    The original token is preserved so BMX+ can still exact-match it.
+    Only used for BMX+ queries — do NOT apply to the embedding query,
+    the embedding model's tokenizer already handles subword splitting
+    internally.
+    """
+    tokens = query.split()
+    expanded = []
+    for token in tokens:
+        expanded.append(token)
+        # snake_case: split on underscores
+        if "_" in token:
+            parts = [p for p in token.split("_") if p]
+            if len(parts) > 1:
+                expanded.extend(p.lower() for p in parts)
+        # camelCase / PascalCase: split on lower→upper transitions
+        elif _HAS_CAMEL_RE.search(token):
+            parts = _CAMEL_SPLIT_RE.sub(r"\1 \2", token).split()
+            if len(parts) > 1:
+                expanded.extend(p.lower() for p in parts)
+        # ALLCAPS with transitions like "XMLParser" → "XML Parser"
+        elif _HAS_ALLCAPS_TRANSITION_RE.search(token):
+            parts = _ALLCAPS_SPLIT_RE.sub(r"\1 \2", token).split()
+            if len(parts) > 1:
+                expanded.extend(p.lower() for p in parts)
+    return " ".join(expanded)
+# ---------------------------------------------------------------------------
+# Helpers — score normalization
+# ---------------------------------------------------------------------------
+def _normalize_scores(scores: dict[str, float]) -> dict[str, float]:
+    """Min-max normalize a dict of scores to [0, 1].
+    If all scores are identical (or there's only one), they all map to 1.0.
+    This ensures both signals occupy the same dynamic range before fusion,
+    so the semantic_weight / bm25_weight ratio is meaningful regardless of
+    how the raw score distributions differ per query.
+    """
+    if not scores:
+        return {}
+    vals = list(scores.values())
+    lo, hi = min(vals), max(vals)
+    spread = hi - lo
+    if spread < 1e-9:
+        return {k: 1.0 for k in scores}
+    return {k: (v - lo) / spread for k, v in scores.items()}
+# ---------------------------------------------------------------------------
+# Helpers — BM25
+# ---------------------------------------------------------------------------
+def _invalidate_bm25(vector_store_id: str) -> None:
+    _bm25_cache.invalidate(vector_store_id)
+async def _get_or_build_bm25_index(
+    vector_store_id: str,
+    repo_root: str | None = None,
+    project_id: str | None = None,
+) -> tuple[BMXIndex, dict[str, dict[str, Any]]]:
+    """
+    Return a cached BM25 index for the given store+scope, building it from
+    the database if necessary.  Paginates reads to avoid OOM.
+    """
+    cached = _bm25_cache.get(vector_store_id, repo_root, project_id)
+    if cached is not None:
+        return cached.index, {}
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+    qb = QueryBuilder()
+    qb.add_condition(f"{fields.vector_store_id_field} = {{}}", vector_store_id)
+    if repo_root:
+        key_ph = qb.add_param("repo_root")
+        val_ph = qb.add_param(repo_root)
+        qb.add_raw_condition(f"{fields.metadata_field}->>{key_ph} = {val_ph}")
+    if project_id:
+        key_ph = qb.add_param("project_id")
+        val_ph = qb.add_param(project_id)
+        qb.add_raw_condition(f"{fields.metadata_field}->>{key_ph} = {val_ph}")
+    where_sql = qb.where_sql()
+    base_params = qb.params
+    chunks: list[dict[str, str]] = []
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    offset = 0
+    while True:
+        page_query = (
+            f"SELECT {fields.id_field}, {fields.content_field}, {fields.lexical_content_field} "
+            f"FROM {table_name} {where_sql} "
+            f"ORDER BY {fields.id_field} "
+            f"LIMIT {settings.search.bm25_page_size} OFFSET {offset}"
+        )
+        page_rows = await db.query_raw(page_query, *base_params)
+        if not page_rows:
+            break
+        fallback_rows = 0
+        for row in page_rows:
+            rows_by_id[row[fields.id_field]] = row
+            lexical_text = row.get(fields.lexical_content_field) or ""
+            text = lexical_text if lexical_text.strip() else row[fields.content_field]
+            if not text or not text.strip():
+                logger.warning("Row %s has no valid text for BMX; skipping", row[fields.id_field])
+                continue
+            chunks.append({
+                "chunk_id": row[fields.id_field],
+                "text": text,
+            })
+            if not lexical_text.strip():
+                fallback_rows += 1
+        if fallback_rows > 0:
+            logger.warning(
+                "Store %s contains pre-backfill rows; BMX falling back to content for %d rows",
+                vector_store_id, fallback_rows
+            )
+        if len(page_rows) < settings.search.bm25_page_size:
+            break
+        offset += settings.search.bm25_page_size
+    # CHANGED: BMXIndex now created with normalize_scores=True so scores
+    # are in [0, 1] — required for convex combination fusion and makes
+    # scores interpretable across queries and corpus sizes.
+    index = BMXIndex(normalize_scores=True)
+    index.build_index(chunks)
+    _bm25_cache.set(
+        vector_store_id, repo_root, project_id, BM25StoreState(index=index)
+    )
+    return index, rows_by_id
+def _coerce_bm25_result(result: Any) -> tuple[BMXIndex | None, dict[str, dict[str, Any]]]:
+    """Normalize BM25 helper responses to (index, rows_by_id)."""
+    if result is None:
+        return None, {}
+    if isinstance(result, tuple):
+        index = result[0]
+        rows_by_id = result[1] if len(result) > 1 and isinstance(result[1], dict) else {}
+        return index, rows_by_id
+    return result, {}
+# ---------------------------------------------------------------------------
+# Helpers — reranking
+# ---------------------------------------------------------------------------
+async def _rerank_candidates(
+    query: str,
+    candidates: list[dict[str, Any]],
+    content_field: str,
+    lexical_content_field: str,
+    top_n: int,
+) -> list[dict[str, Any]] | None:
+    """
+    Call the configured rerank endpoint.  Returns a re-ordered list of
+    candidate dicts with updated scores, or *None* on failure.
+    """
+    documents = []
+    for c in candidates:
+        lc = c["row"].get(lexical_content_field) or ""
+        doc_text = lc if lc.strip() else c["row"][content_field]
+        documents.append(doc_text)
+    rerank_max_attempts = settings.search.rerank_max_attempts
+    rerank_retry_delays = [float(x) for x in settings.search.rerank_retry_delays.split(",")]
+    for attempt in range(rerank_max_attempts):
+        try:
+            async with httpx.AsyncClient(timeout=settings.search.rerank_timeout) as client:
+                resp = await client.post(
+                    f"{settings.embedding.base_url.rstrip('/')}/rerank",
+                    headers={
+                        "Authorization": f"Bearer {settings.embedding.api_key}",
+                    },
+                    json={
+                        "model": settings.search.rerank_model,
+                        "query": query,
+                        "documents": documents,
+                        "top_n": top_n,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError):
+            if attempt < rerank_max_attempts - 1:
+                await asyncio.sleep(rerank_retry_delays[min(attempt, len(rerank_retry_delays) - 1)])
+                continue
+            logger.warning("Rerank failed after %d attempts", rerank_max_attempts)
+            return None
+        except Exception:
+            logger.exception("Unexpected rerank error")
+            return None
+        reranked: list[dict[str, Any]] = []
+        for item in data.get("results", []):
+            idx = item["index"]
+            candidate = dict(candidates[idx])  # shallow copy to avoid mutating original
+            candidate["rerank_score"] = item["relevance_score"]
+            reranked.append(candidate)
+        return reranked
+    return None
+# ---------------------------------------------------------------------------
+# Helpers — vector store existence check
+# ---------------------------------------------------------------------------
+async def _assert_vector_store_exists(vector_store_id: str) -> None:
+    """Raise 404 if the vector store doesn't exist."""
+    table = settings.table_names["vector_stores"]
+    rows = await db.query_raw(
+        f"SELECT id FROM {table} WHERE id = $1", vector_store_id
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Vector store not found")
+# ---------------------------------------------------------------------------
+# Helpers — vector store stats update
+# ---------------------------------------------------------------------------
+async def _update_vector_store_stats(
+    vector_store_id: str,
+    added_count: int,
+    added_bytes: int,
+) -> None:
+    """Atomically bump completed/total file counts and usage_bytes."""
+    table = settings.table_names["vector_stores"]
+    default_fc = (
+        '{"in_progress": 0, "completed": 0, "failed": 0, '
+        '"cancelled": 0, "total": 0}'
+    )
+    await db.query_raw(
+        f"""
+        UPDATE {table}
+        SET
+            file_counts = jsonb_set(
+                jsonb_set(
+                    COALESCE(file_counts, '{default_fc}'::jsonb),
+                    '{{completed}}',
+                    (COALESCE(file_counts->>'completed', '0')::int + $2)::text::jsonb
+                ),
+                '{{total}}',
+                (COALESCE(file_counts->>'total', '0')::int + $2)::text::jsonb
+            ),
+            usage_bytes = COALESCE(usage_bytes, 0) + $3,
+            last_active_at = NOW()
+        WHERE id = $1
+        """,
+        vector_store_id,
+        added_count,
+        added_bytes,
+    )
+# ---------------------------------------------------------------------------
+# Helpers — cursor resolution for pagination
+# ---------------------------------------------------------------------------
+async def _resolve_cursor(table: str, cursor_id: str) -> RowDict:
+    rows = await db.query_raw(
+        f"SELECT id, created_at FROM {table} WHERE id = $1", cursor_id
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Cursor not found")
+    return rows[0]  # type: ignore[no-any-return]
+# ---------------------------------------------------------------------------
+# Helpers — build responses from raw DB rows
+# ---------------------------------------------------------------------------
+def _vector_store_from_row(row: RowDict) -> VectorStoreResponse:
+    return VectorStoreResponse(
+        id=row["id"],
+        created_at=int(row["created_at_timestamp"]),
+        name=row["name"],
+        usage_bytes=row["usage_bytes"] or 0,
+        file_counts=row["file_counts"] or dict(DEFAULT_FILE_COUNTS),
+        status=row["status"],
+        expires_after=row["expires_after"],
+        expires_at=_to_unix_ts(row.get("expires_at")),
+        last_active_at=_to_unix_ts(row.get("last_active_at")),
+        metadata=row["metadata"],
+    )
+def _embedding_from_row(row: RowDict) -> EmbeddingResponse:
+    fields = settings.db_fields
+    return EmbeddingResponse(
+        id=row[fields.id_field],
+        vector_store_id=row[fields.vector_store_id_field],
+        content=row[fields.content_field],
+        metadata=row[fields.metadata_field],
+        created_at=int(row["created_at_timestamp"]),
+    )
+# ---------------------------------------------------------------------------
+# NEW: Per-file cap for reranker diversity
+# ---------------------------------------------------------------------------
+def _cap_per_file(
+    candidates: list[dict[str, Any]],
+    metadata_field: str,
+    max_per_file: int = 3,
+) -> list[dict[str, Any]]:
+    """
+    Keep at most *max_per_file* chunks per source file going into the
+    reranker. Candidates must already be sorted best-first by fusion score.
+    This prevents one heavily-chunked file from monopolizing the reranker's
+    budget while still giving the reranker multiple chunks per file to
+    choose the best from. 3 is the sweet spot — covers the common
+    "signature chunk vs implementation chunk vs docstring chunk" splits.
+    """
+    file_counts: dict[str, int] = defaultdict(int)
+    capped: list[dict[str, Any]] = []
+    for c in candidates:
+        meta = c["row"].get(metadata_field) or {}
+        src = (
+            meta.get("doc_path")
+            or meta.get("source")
+            or meta.get("filename")
+            or ""
+        )
+        if file_counts[src] < max_per_file:
+            capped.append(c)
+            file_counts[src] += 1
+    return capped
+# ---------------------------------------------------------------------------
+# NEW: Post-rerank deduplication by source file
+# ---------------------------------------------------------------------------
+def _deduplicate_by_source_post_rerank(
+    candidates: list[dict[str, Any]],
+    metadata_field: str,
+) -> list[dict[str, Any]]:
+    """
+    After reranking, keep only the highest-scoring chunk per source file.
+    Candidates must already be sorted best-first by the reranker (or by
+    fusion score if reranking was skipped).
+    CHANGED: This replaces the old _deduplicate_by_source which ran BEFORE
+    reranking. Moving dedup after reranking lets the cross-encoder pick
+    the best chunk per file instead of relying on fusion scores to guess.
+    """
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for c in candidates:
+        meta = c["row"].get(metadata_field) or {}
+        src = (
+            meta.get("doc_path")
+            or meta.get("source")
+            or meta.get("filename")
+            or ""
+        )
+        if src not in seen:
+            seen.add(src)
+            deduped.append(c)
+    return deduped
+# ---------------------------------------------------------------------------
+# NEW: Convex Combination fusion (replaces RRF)
+# ---------------------------------------------------------------------------
+def _fuse_convex_combination(
+    semantic_candidates: list[dict[str, Any]],
+    bm25_results: list[tuple[str, float]],
+    bm25_only_rows: dict[str, RowDict],
+    semantic_weight: float,
+    bm25_weight: float,
+) -> list[dict[str, Any]]:
+    """
+    Convex Combination fusion with per-query score normalization.
+    Both input signals are min-max normalized to [0, 1] independently
+    before combining.  This compensates for the different raw score
+    distributions: semantic cosine similarities typically cluster in a
+    narrow band (0.55–0.75) while BMX+ scores spread across the full
+    range.  Without normalization, the signal with wider spread
+    dominates regardless of the configured weights.
+    combined_score = semantic_weight * norm_sem + bm25_weight * norm_bmx
+    Chunks appearing in only one signal get 0.0 for the missing signal
+    (after normalization of the present signal).
+    """
+    # Build raw score lookups
+    sem_by_id: dict[str, dict[str, Any]] = {}
+    raw_sem: dict[str, float] = {}
+    for c in semantic_candidates:
+        cid = c["chunk_id"]
+        sem_by_id[cid] = c
+        raw_sem[cid] = c["score"]
+    raw_bmx: dict[str, float] = {}
+    for cid, score in bm25_results:
+        raw_bmx[cid] = score
+    # Per-query min-max normalization
+    norm_sem = _normalize_scores(raw_sem)
+    norm_bmx = _normalize_scores(raw_bmx)
+    # Union of all chunk IDs from both signals
+    all_ids = set(raw_sem.keys()) | set(raw_bmx.keys())
+    fused: list[dict[str, Any]] = []
+    for cid in all_ids:
+        ns = norm_sem.get(cid, 0.0)
+        nb = norm_bmx.get(cid, 0.0)
+        combined = semantic_weight * ns + bm25_weight * nb
+        if cid in sem_by_id:
+... [910 frames omitted]
+================================================================================
+
+[ COMPRESSED 30%  →  budget 18,105 chars  |  actual 30%  |  18,129 chars  |  430 lines ]
+================================================================================
+"""
+OpenAI-compatible Vector Stores API using PGVector.
+This module provides the FastAPI application with endpoints for creating,
+listing, and searching vector stores, as well as managing embeddings.
+"""
+import asyncio
+import logging
+import math
+import re
+import time
+import uuid
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any
+from collections.abc import AsyncIterator
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from prisma import Prisma  # type: ignore[attr-defined]
+from dotenv import load_dotenv
+from models import (
+    ContentChunk,
+    DeleteEmbeddingsResponse,
+    EmbeddingBatchCreateRequest,
+    EmbeddingBatchCreateResponse,
+    EmbeddingCreateRequest,
+    EmbeddingResponse,
+    SearchResult,
+    VectorStoreCreateRequest,
+    VectorStoreListResponse,
+    VectorStoreResponse,
+    VectorStoreSearchRequest,
+    VectorStoreSearchResponse,
+    VectorStoreSourcesResponse,
+)
+from config import settings
+from embedding_service import embedding_service
+from project_registry import ProjectRegistry
+from retrieval_bmx import BMXIndex
+from retrieval_hybrid import BM25StoreCache, BM25StoreState
+from symbol_table import (
+    build_symbol_record,
+    delete_symbol_records,
+    insert_symbol_records,
+    merge_tiered_results,
+    search_symbols_exact,
+    search_symbols_fuzzy,
+)
+load_dotenv()
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+DEFAULT_FILE_COUNTS = {
+    "in_progress": 0,
+    "completed": 0,
+    "failed": 0,
+    "cancelled": 0,
+    "total": 0,
+}
+DEFAULT_CORS_ALLOW_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+# ---------------------------------------------------------------------------
+# Regex for identifier splitting (compiled once at module level)
+# ---------------------------------------------------------------------------
+_CAMEL_SPLIT_RE = re.compile(r"([a-z])([A-Z])")
+_ALLCAPS_SPLIT_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_HAS_CAMEL_RE = re.compile(r"[a-z][A-Z]")
+_HAS_ALLCAPS_TRANSITION_RE = re.compile(r"[A-Z]{2,}[a-z]")
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+db = Prisma()
+# ---------------------------------------------------------------------------
+# Singletons / Caches
+# ---------------------------------------------------------------------------
+_bm25_cache = BM25StoreCache()  # type: ignore[no-untyped-call]
+_project_registry: ProjectRegistry | None = None
+def get_project_registry() -> ProjectRegistry:
+    """Lazy-load and cache the project registry from disk."""
+    global _project_registry
+    if _project_registry is None:
+        _project_registry = ProjectRegistry.load(settings.ragconfig_path)
+    return _project_registry
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Connect to DB on startup, disconnect on shutdown."""
+    await db.connect()
+    logger.info("Database connected")
+    yield
+    await db.disconnect()
+    logger.info("Database disconnected")
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="OpenAI Vector Stores API",
+    description="OpenAI-compatible Vector Stores API using PGVector",
+    version="2.1.0",  # CHANGED: bumped version for this overhaul
+    lifespan=lifespan,
+)
+cors_allow_origins = [
+    origin.strip()
+    for origin in settings.cors_allow_origins.split(",")
+    if origin.strip()
+]
+cors_allow_origin_regex = settings.cors_allow_origin_regex.strip() or None
+if not cors_allow_origins and cors_allow_origin_regex is None:
+    cors_allow_origins = DEFAULT_CORS_ALLOW_ORIGINS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_allow_origins,
+    allow_origin_regex=cors_allow_origin_regex,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+security = HTTPBearer()
+# ---------------------------------------------------------------------------
+# Middleware — request ID + error handling
+# ---------------------------------------------------------------------------
+@app.middleware("http")  # type: ignore[untyped-decorator]
+async def request_context_middleware(request: Request, call_next: Any) -> Response:
+    """Attach a unique request ID and handle uncaught exceptions uniformly."""
+    request_id = request.headers.get("X-Request-ID", uuid.uuid4().hex[:12])
+    request.state.request_id = request_id
+    try:
+        response: Response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception:
+        logger.warning("Unhandled exception [request_id=%s]", request_id, exc_info=True)
+        raise
+# ---------------------------------------------------------------------------
+# Type alias for untyped dicts returned from the DB
+# ---------------------------------------------------------------------------
+RowDict = dict[str, Any]
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+async def get_api_key(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> str:
+    """Validate the Bearer token against the configured server API key."""
+    if credentials.credentials != settings.server_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return credentials.credentials  # type: ignore[no-any-return]
+# ---------------------------------------------------------------------------
+# Helpers — time conversion
+# ---------------------------------------------------------------------------
+def _to_unix_ts(val: Any) -> int | None:
+    """Convert a datetime, ISO-8601 string, or None → Unix timestamp int."""
+    if val is None:
+        return None
+    if hasattr(val, "timestamp"):
+        return int(val.timestamp())
+    try:
+        dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return None
+# ---------------------------------------------------------------------------
+# Helpers — SQL query builder
+# ---------------------------------------------------------------------------
+class QueryBuilder:
+    """
+    Lightweight helper to build parameterized SQL without manual $N counting.
+    Usage:
+        qb = QueryBuilder()
+        qb.add_condition("name = {}", "Alice")
+        ph = qb.add_param(some_value)
+        qb.add_raw_condition(f"col = {ph}")
+        where = qb.where_sql()
+        params = qb.params
+    """
+    def __init__(self, *, start_param: int = 1) -> None:
+        self._conditions: list[str] = []
+        self._params: list[Any] = []
+        self._counter = start_param
+    @property
+    def param_count(self) -> int:
+        return self._counter
+    @property
+    def params(self) -> list[Any]:
+        return list(self._params)
+    def add_param(self, value: Any) -> str:
+        """Register a parameter and return its $N placeholder."""
+        ph = f"${self._counter}"
+        self._counter += 1
+        self._params.append(value)
+        return ph
+    def add_condition(self, template: str, *values: Any) -> "QueryBuilder":
+        """
+        Add a WHERE condition. Use `{}` as placeholder markers in *template*;
+        each `{}` is replaced with a new `$N` for the corresponding value.
+        """
+        parts: list[str] = []
+        tpl_parts = template.split("{}")
+        for i, part in enumerate(tpl_parts):
+            parts.append(part)
+            if i < len(values):
+                parts.append(self.add_param(values[i]))
+        self._conditions.append("".join(parts))
+        return self
+    def add_raw_condition(self, sql: str) -> "QueryBuilder":
+        """
+        Add a pre-built SQL condition string (no placeholder substitution).
+        Use this when you've already called add_param() to get placeholders.
+        """
+        self._conditions.append(sql)
+        return self
+    def where_sql(self, *, prefix: str = "WHERE ") -> str:
+        """Return the full WHERE string, or empty string if no conditions."""
+        if not self._conditions:
+            return ""
+        return prefix + " AND ".join(self._conditions)
+# ---------------------------------------------------------------------------
+# Helpers — metadata filters → SQL conditions
+# ---------------------------------------------------------------------------
+def _append_metadata_filters(
+    qb: QueryBuilder,
+    filters: dict[str, str],
+    metadata_field: str,
+) -> None:
+    """Add ``metadata->>'key' = value`` conditions for each filter entry."""
+    for key, value in filters.items():
+        key_ph = qb.add_param(key)
+        val_ph = qb.add_param(str(value))
+        qb.add_raw_condition(f"{metadata_field}->>{key_ph} = {val_ph}")
+def _metadata_matches_filters(metadata: dict[str, Any] | None, filters: dict[str, str] | None) -> bool:
+    """In-memory check that *metadata* satisfies every key=value in *filters*."""
+    if not filters:
+        return True
+    metadata = metadata or {}
+    return all(str(metadata.get(k)) == str(v) for k, v in filters.items())
+# ---------------------------------------------------------------------------
+# Helpers — scope resolution
+# ---------------------------------------------------------------------------
+def _candidate_scope_inputs(http_request: Request | None) -> list[str]:
+    """
+    Gather candidate scope strings from request headers based on configured
+    alias lists (workspace, cwd, repo_root, project).
+    """
+    if http_request is None:
+        return []
+    headers = http_request.headers
+    candidates: list[str] = []
+    alias_sources = (
+        settings.search.scope_header_workspace_aliases,
+        settings.search.scope_header_cwd_aliases,
+        settings.search.scope_header_repo_root_aliases,
+        settings.search.scope_header_project_aliases,
+    )
+    for alias_string in alias_sources:
+        for alias in alias_string.split(","):
+            alias = alias.strip()
+            if alias:
+                value = headers.get(alias)
+                if value:
+                    candidates.append(value)
+    return candidates
+def resolve_hidden_scope(
+    http_request: Request | None,
+) -> tuple[str | None, str | None]:
+    """
+    Resolve a hidden (repo_root, project_id) scope from request headers
+    using the project registry.  Returns (None, None) if disabled or
+    no match is found.
+    """
+    if not settings.search.scope_binding_enabled or http_request is None:
+        return None, None
+    registry = get_project_registry()
+    for candidate in _candidate_scope_inputs(http_request):
+        match = registry.find_project(candidate)
+        if match:
+            return match.project_root, match.project_id
+    return None, None
+def build_effective_filters(
+    request_filters: dict[str, str] | None,
+    hidden_repo_root: str | None,
+    hidden_project_id: str | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Merge user-supplied filters with hidden scope overrides.
+    Returns:
+        (effective_filters, scope_filters)
+    """
+    effective = dict(request_filters or {})
+    # Normalize legacy "project" key → "project_id"
+    if "project" in effective:
+        effective.setdefault("project_id", effective.pop("project"))
+    request_repo_root = effective.get("repo_root")
+    request_project_id = effective.get("project_id")
+    if hidden_repo_root:
+        effective["repo_root"] = hidden_repo_root
+    if hidden_project_id:
+        effective["project_id"] = hidden_project_id
+    scope: dict[str, str] = {}
+    repo_root = hidden_repo_root or request_repo_root
+    project_id = hidden_project_id or request_project_id
+    if repo_root:
+        scope["repo_root"] = repo_root
+    if project_id:
+        scope["project_id"] = project_id
+    return effective, scope
+# ---------------------------------------------------------------------------
+# Helpers — code-aware decoration
+# ---------------------------------------------------------------------------
+def _is_code_metadata(metadata: dict[str, Any] | None) -> bool:
+    return (metadata or {}).get("content_type") == "code"
+def _prepend_code_warning(text: str, metadata: dict[str, Any] | None) -> str:
+    if not settings.search.code_aware_enabled or not _is_code_metadata(metadata):
+        return text
+    warning = settings.search.code_result_warning.strip()
+    if warning and not text.startswith(warning):
+        return f"{warning}\n{text}"
+    return text
+# ---------------------------------------------------------------------------
+# Helpers — embedding generation
+# ---------------------------------------------------------------------------
+async def _generate_query_embedding(query: str) -> list[float]:
+    """Generate a vector embedding for *query* via the configured service."""
+    return await embedding_service.generate_embedding(query)
+# ---------------------------------------------------------------------------
+# NEW: Query preprocessing — identifier token expansion for BMX+
+# ---------------------------------------------------------------------------
+def expand_identifier_tokens(query: str) -> str:
+    """
+    Expand camelCase, PascalCase, and snake_case identifiers into
+    constituent words ALONGSIDE the original token.
+    "parseConfigFile"             -> "parseConfigFile parse config file"
+    "handle_websocket_connection" -> "handle_websocket_connection handle websocket connection"
+    "XMLParser"                   -> "XMLParser xml parser"
+    The original token is preserved so BMX+ can still exact-match it.
+    Only used for BMX+ queries — do NOT apply to the embedding query,
+    the embedding model's tokenizer already handles subword splitting
+    internally.
+    """
+    tokens = query.split()
+    expanded = []
+    for token in tokens:
+        expanded.append(token)
+        # snake_case: split on underscores
+        if "_" in token:
+            parts = [p for p in token.split("_") if p]
+            if len(parts) > 1:
+                expanded.extend(p.lower() for p in parts)
+        # camelCase / PascalCase: split on lower→upper transitions
+        elif _HAS_CAMEL_RE.search(token):
+            parts = _CAMEL_SPLIT_RE.sub(r"\1 \2", token).split()
+            if len(parts) > 1:
+                expanded.extend(p.lower() for p in parts)
+        # ALLCAPS with transitions like "XMLParser" → "XML Parser"
+        elif _HAS_ALLCAPS_TRANSITION_RE.search(token):
+            parts = _ALLCAPS_SPLIT_RE.sub(r"\1 \2", token).split()
+            if len(parts) > 1:
+                expanded.extend(p.lower() for p in parts)
+    return " ".join(expanded)
+# ---------------------------------------------------------------------------
+# Helpers — score normalization
+# ---------------------------------------------------------------------------
+def _normalize_scores(scores: dict[str, float]) -> dict[str, float]:
+    """Min-max normalize a dict of scores to [0, 1].
+    If all scores are identical (or there's only one), they all map to 1.0.
+    This ensures both signals occupy the same dynamic range before fusion,
+    so the semantic_weight / bm25_weight ratio is meaningful regardless of
+    how the raw score distributions differ per query.
+    """
+    if not scores:
+        return {}
+    vals = list(scores.values())
+    lo, hi = min(vals), max(vals)
+    spread = hi - lo
+    if spread < 1e-9:
+        return {k: 1.0 for k in scores}
+    return {k: (v - lo) / spread for k, v in scores.items()}
+# ---------------------------------------------------------------------------
+# Helpers — BM25
+# ---------------------------------------------------------------------------
+def _invalidate_bm25(vector_store_id: str) -> None:
+    _bm25_cache.invalidate(vector_store_id)
+async def _get_or_build_bm25_index(
+    vector_store_id: str,
+    repo_root: str | None = None,
+    project_id: str | None = None,
+) -> tuple[BMXIndex, dict[str, dict[str, Any]]]:
+    """
+    Return a cached BM25 index for the given store+scope, building it from
+    the database if necessary.  Paginates reads to avoid OOM.
+    """
+    cached = _bm25_cache.get(vector_store_id, repo_root, project_id)
+    if cached is not None:
+        return cached.index, {}
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+    qb = QueryBuilder()
+    qb.add_condition(f"{fields.vector_store_id_field} = {{}}", vector_store_id)
+    if repo_root:
+        key_ph = qb.add_param("repo_root")
+        val_ph = qb.add_param(repo_root)
+        qb.add_raw_condition(f"{fields.metadata_field}->>{key_ph} = {val_ph}")
+    if project_id:
+        key_ph = qb.add_param("project_id")
+        val_ph = qb.add_param(project_id)
+        qb.add_raw_condition(f"{fields.metadata_field}->>{key_ph} = {val_ph}")
+    where_sql = qb.where_sql()
+    base_params = qb.params
+    offset = 0
+        )
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError):
+        except Exception:
+            logger.exception("Unexpected rerank error")
+        raise HTTPException(status_code=404, detail="Vector store not found")
+        raise HTTPException(status_code=404, detail="Cursor not found")
+)
+... [1193 frames omitted]
+================================================================================
+
+[ COMPRESSED 15%  →  budget 9,052 chars  |  actual 15%  |  9,077 chars  |  231 lines ]
+================================================================================
+"""
+OpenAI-compatible Vector Stores API using PGVector.
+This module provides the FastAPI application with endpoints for creating,
+listing, and searching vector stores, as well as managing embeddings.
+"""
+import asyncio
+import logging
+import math
+import re
+import time
+import uuid
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any
+from collections.abc import AsyncIterator
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from prisma import Prisma  # type: ignore[attr-defined]
+from dotenv import load_dotenv
+from models import (
+    ContentChunk,
+    DeleteEmbeddingsResponse,
+    EmbeddingBatchCreateRequest,
+    EmbeddingBatchCreateResponse,
+    EmbeddingCreateRequest,
+    EmbeddingResponse,
+    SearchResult,
+    VectorStoreCreateRequest,
+    VectorStoreListResponse,
+    VectorStoreResponse,
+    VectorStoreSearchRequest,
+    VectorStoreSearchResponse,
+    VectorStoreSourcesResponse,
+)
+from config import settings
+from embedding_service import embedding_service
+from project_registry import ProjectRegistry
+from retrieval_bmx import BMXIndex
+from retrieval_hybrid import BM25StoreCache, BM25StoreState
+from symbol_table import (
+    build_symbol_record,
+    delete_symbol_records,
+    insert_symbol_records,
+    merge_tiered_results,
+    search_symbols_exact,
+    search_symbols_fuzzy,
+)
+load_dotenv()
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+DEFAULT_FILE_COUNTS = {
+    "in_progress": 0,
+    "completed": 0,
+    "failed": 0,
+    "cancelled": 0,
+    "total": 0,
+}
+DEFAULT_CORS_ALLOW_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+# ---------------------------------------------------------------------------
+# Regex for identifier splitting (compiled once at module level)
+# ---------------------------------------------------------------------------
+_CAMEL_SPLIT_RE = re.compile(r"([a-z])([A-Z])")
+_ALLCAPS_SPLIT_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_HAS_CAMEL_RE = re.compile(r"[a-z][A-Z]")
+_HAS_ALLCAPS_TRANSITION_RE = re.compile(r"[A-Z]{2,}[a-z]")
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+db = Prisma()
+# ---------------------------------------------------------------------------
+# Singletons / Caches
+# ---------------------------------------------------------------------------
+_bm25_cache = BM25StoreCache()  # type: ignore[no-untyped-call]
+_project_registry: ProjectRegistry | None = None
+def get_project_registry() -> ProjectRegistry:
+    """Lazy-load and cache the project registry from disk."""
+    global _project_registry
+    if _project_registry is None:
+        _project_registry = ProjectRegistry.load(settings.ragconfig_path)
+    return _project_registry
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Connect to DB on startup, disconnect on shutdown."""
+    await db.connect()
+    logger.info("Database connected")
+    yield
+    await db.disconnect()
+    logger.info("Database disconnected")
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="OpenAI Vector Stores API",
+    description="OpenAI-compatible Vector Stores API using PGVector",
+    version="2.1.0",  # CHANGED: bumped version for this overhaul
+    lifespan=lifespan,
+)
+cors_allow_origins = [
+    origin.strip()
+    for origin in settings.cors_allow_origins.split(",")
+    if origin.strip()
+]
+cors_allow_origin_regex = settings.cors_allow_origin_regex.strip() or None
+if not cors_allow_origins and cors_allow_origin_regex is None:
+    cors_allow_origins = DEFAULT_CORS_ALLOW_ORIGINS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_allow_origins,
+    allow_origin_regex=cors_allow_origin_regex,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+security = HTTPBearer()
+# ---------------------------------------------------------------------------
+# Middleware — request ID + error handling
+# ---------------------------------------------------------------------------
+@app.middleware("http")  # type: ignore[untyped-decorator]
+async def request_context_middleware(request: Request, call_next: Any) -> Response:
+    """Attach a unique request ID and handle uncaught exceptions uniformly."""
+    request_id = request.headers.get("X-Request-ID", uuid.uuid4().hex[:12])
+    request.state.request_id = request_id
+    try:
+        response: Response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception:
+        logger.warning("Unhandled exception [request_id=%s]", request_id, exc_info=True)
+        raise
+# ---------------------------------------------------------------------------
+# Type alias for untyped dicts returned from the DB
+# ---------------------------------------------------------------------------
+RowDict = dict[str, Any]
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+async def get_api_key(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> str:
+    """Validate the Bearer token against the configured server API key."""
+    if credentials.credentials != settings.server_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return credentials.credentials  # type: ignore[no-any-return]
+# ---------------------------------------------------------------------------
+# Helpers — time conversion
+# ---------------------------------------------------------------------------
+def _to_unix_ts(val: Any) -> int | None:
+    """Convert a datetime, ISO-8601 string, or None → Unix timestamp int."""
+    if val is None:
+        return None
+    if hasattr(val, "timestamp"):
+        return int(val.timestamp())
+    try:
+        dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return None
+# ---------------------------------------------------------------------------
+# Helpers — SQL query builder
+# ---------------------------------------------------------------------------
+class QueryBuilder:
+    """
+    Lightweight helper to build parameterized SQL without manual $N counting.
+    Usage:
+        qb = QueryBuilder()
+        qb.add_condition("name = {}", "Alice")
+        ph = qb.add_param(some_value)
+        qb.add_raw_condition(f"col = {ph}")
+        where = qb.where_sql()
+        params = qb.params
+    """
+    def __init__(self, *, start_param: int = 1) -> None:
+        self._conditions: list[str] = []
+        self._params: list[Any] = []
+        self._counter = start_param
+    @property
+    def param_count(self) -> int:
+        return self._counter
+    @property
+    def params(self) -> list[Any]:
+        return list(self._params)
+    def add_param(self, value: Any) -> str:
+        """Register a parameter and return its $N placeholder."""
+        ph = f"${self._counter}"
+        self._counter += 1
+        self._params.append(value)
+        return ph
+    def add_condition(self, template: str, *values: Any) -> "QueryBuilder":
+        """
+        Add a WHERE condition. Use `{}` as placeholder markers in *template*;
+        each `{}` is replaced with a new `$N` for the corresponding value.
+        """
+        parts: list[str] = []
+        tpl_parts = template.split("{}")
+        for i, part in enumerate(tpl_parts):
+            parts.append(part)
+            if i < len(values):
+                parts.append(self.add_param(values[i]))
+        self._conditions.append("".join(parts))
+        return self
+    def add_raw_condition(self, sql: str) -> "QueryBuilder":
+        """
+        """
+        return self
+) -> None:
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError):
+        except Exception:
+            logger.exception("Unexpected rerank error")
+        raise HTTPException(status_code=404, detail="Vector store not found")
+        raise HTTPException(status_code=404, detail="Cursor not found")
+)
+)
+... [1392 frames omitted]
+================================================================================
+

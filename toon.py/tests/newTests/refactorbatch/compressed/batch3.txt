@@ -1,0 +1,104 @@
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { randomBytes, createHash } from 'crypto';
+import { getProjectContext } from '../core/project-context.js';
+import {
+    getDb, indexDirectory, ensureIndexFresh, indexFile,
+    impactQuery, getSessionId, findRepoRoot, snapshotSymbol,
+    getVersionHistory, getVersionText,
+} from '../core/symbol-index.js';
+import {
+    getLangForFile, findSymbol, getSymbolStructure, checkSyntaxErrors,
+} from '../core/tree-sitter.js';
+import { applyEditList, syntaxWarn } from '../core/edit-engine.js';
+import { normalizeLineEndings } from '../core/lib.js';
+
+// ---------------------------------------------------------------------------
+// Module-level constants
+// ---------------------------------------------------------------------------
+
+const MAX_CHARS = Number(process.env.REFACTOR_MAX_CHARS) || 30000;
+const DEFAULT_CONTEXT = 5;
+const MAX_CONTEXT_LINES = Math.min(30, Number(process.env.REFACTOR_MAX_CONTEXT) || 30);
+
+// ---------------------------------------------------------------------------
+// Module-level caches (per-process, keyed by `${repoRoot}::${sessionId}`)
+// ---------------------------------------------------------------------------
+
+const _loadCache = new Map();
+// Reserved for Task 2.1 (apply/reapply) — declared now so Wave 2 only extends.
+const _payloadCache = new Map();
+// Keyed by `${repoRoot}::${sessionId}::${symbolName}`. Locks a group after 1 failed retry.
+const _retryState = new Map();
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+# ... [lines 39-55 omitted]
+
+# ... [lines 57-73 omitted]
+
+# ... [lines 75-83 omitted]
+
+// Parses:
+//   validateCard 1,2,3 ack:3
+//   function validateCard(card) { ... }
+//
+//   chargeStripe 1,2
+//   function chargeStripe(card, amount) { ... }
+//
+// Returns: [{symbol, indices: number[], ack: number[], body: string}, ...]
+# ... [lines 93-109 omitted]
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+export function register(server, ctx) {  # L115
+    server.registerTool("refactor_batch", {
+        title: "Refactor Batch",
+        description: "Apply one edit pattern across multiple similar symbols, with rollback. Core pipeline: loadDiff (symbol bodies + context) → apply (write edits). query is optional — you can skip it and call loadDiff directly with explicit {symbol, file} pairs if you already know the targets (e.g. from search_files). After a successful apply: reapply sends the same cached edit to new targets, restore rolls back any symbol to a prior snapshot. Every apply/reapply/restore snapshots pre-edit text automatically. No default mode — mode is always required.",
+        inputSchema: z.object({
+            mode: z.enum(["query", "loadDiff", "apply", "reapply", "restore", "history"]).describe(
+                "Required. query: impact analysis — who calls/is called by a symbol. loadDiff: load symbol bodies with surrounding context into a diff you edit and send back. apply: write the edited diff. reapply: apply a previously successful edit pattern to new targets. restore: rollback a symbol to a snapshotted version. history: list available version snapshots for a symbol."
+            ),
+            target: z.string().optional().describe("query: The symbol name to analyze for impact. Returns numbered list of callers (forward) or callees (reverse) grouped by file. Optional step — you can skip query entirely and go straight to loadDiff with explicit {symbol, file} pairs."),
+            fileScope: z.string().optional().describe("query: Repo-relative file path. Required when target has definitions in multiple files — the server will list them and ask you to pick."),
+            direction: z.enum(["forward", "reverse"]).default("forward").describe("query: forward = which symbols call target (blast radius). reverse = what does target call (dependencies)."),
+            depth: z.number().int().min(1).max(5).default(1).describe("query: How many hops to traverse the call graph. 1 = direct callers/callees only."),
+            selection: z.array(z.union([
+                z.number().int().min(1),
+                z.object({ symbol: z.string(), file: z.string().optional() }),
+            ])).optional().describe("loadDiff: Which symbols to load. Either numeric indices from a prior query result, or explicit {symbol, file?} pairs. You can skip query and go straight to loadDiff with explicit pairs."),
+            contextLines: z.number().int().min(0).max(MAX_CONTEXT_LINES).default(DEFAULT_CONTEXT).describe("loadDiff: How many lines above and below each symbol body to include as read-only context. Context lines are marked with │ so you can distinguish them from the editable body."),
+                # ... [lines 132-153 omitted]
+                return { content: [{ type: 'text', text: 'target required for query.' }] };
+                # ... [lines 155-186 omitted]
+                return { content: [{ type: 'text', text: 'Multiple definitions:\n' + result.definitions.join('\n') }] };
+                # ... [lines 188-198 omitted]
+                return { content: [{ type: 'text', text: 'No references.' }] };
+                    # ... [lines 200-204 omitted]
+                    return `${idx}) ${r.name}[${r.refCount}x] (${r.filePath})`;
+                }
+                return `${idx}) ${r.name}[${r.callCount}x]`;
+            return { content: [{ type: 'text', text: lines.join('\n') }] };
+                # ... [lines 211-217 omitted]
+                return { content: [{ type: 'text', text: 'selection required for loadDiff (or use loadMore=true to continue).' }] };
+                    # ... [lines 219-231 omitted]
+                    return { content: [{ type: 'text', text: 'Nothing to continue.' }] };
+                            # ... [lines 233-241 omitted]
+                            return { content: [{ type: 'text', text: 'Run query first.' }] };
+                # ... [lines 243-413 omitted]
+                return { content: [{ type: 'text', text: 'No symbols loaded.' }] };
+            # ... [lines 415-425 omitted]
+            return { content: [{ type: 'text', text: out }] };
+                # ... [lines 427-433 omitted]
+                return { content: [{ type: 'text', text: 'payload required for apply.' }] };
+                # ... [lines 435-444 omitted]
+                return { content: [{ type: 'text', text: 'No diff loaded. Call loadDiff first.' }] };
+                # ... [lines 446-449 omitted]
+                return { content: [{ type: 'text', text: 'No diff loaded. Call loadDiff first.' }] };
+                    # ... [lines 451-468 omitted]
+                    return { content: [{ type: 'text', text: `Unknown symbol: ${g.symbol}. Run loadDiff first.` }] };
