@@ -1,594 +1,275 @@
-# TOON — Threshold-Optimized Output Notation
+# TOON
 
-> **Intelligent LLM context compression** — entropy-weighted scoring meets structural encoding.
+**Smart compression for LLM context windows** — available in Python and TypeScript.
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![TypeScript](https://img.shields.io/badge/typescript-5.x-blue?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Status: Beta](https://img.shields.io/badge/status-beta-orange)](https://pypi.org/project/toon-plus/)
-[![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20runtime-brightgreen)](toon.py/pyproject.toml)
-
-TOON is a dual-implementation (Python + TypeScript) LLM context compression system. Instead of blind truncation, it uses a three-stage pipeline — **deduplication → entropy-weighted scoring → budget-aware compression** — to make principled decisions about what to keep, what to cut, and how much space each piece of content deserves.
-
-Two standalone scoring engines (BMX+ and SageRank) power the pipeline with no external runtime dependencies.
+[![Zero Runtime Dependencies](https://img.shields.io/badge/dependencies-zero%20runtime-brightgreen)](toon.py/pyproject.toml)
 
 ---
 
-## Table of Contents
+## What is TOON?
 
-- [What TOON Does](#what-toon-does)
-- [Tech Stack](#tech-stack)
-- [Repository Structure](#repository-structure)
-- [Architecture Overview](#architecture-overview)
-  - [The Three-Stage Pipeline](#the-three-stage-pipeline)
-  - [Scoring Engines](#scoring-engines)
-  - [String Codec](#string-codec)
-  - [Tree-sitter Integration](#tree-sitter-integration)
-  - [Configuration System](#configuration-system)
-- [Features](#features)
-- [Getting Started](#getting-started)
-  - [Python](#python)
-  - [TypeScript](#typescript)
-- [API Reference](#api-reference)
-  - [Python API](#python-api)
-  - [TypeScript API](#typescript-api)
-- [CLI](#cli)
-- [Configuration &amp; Presets](#configuration--presets)
-- [Scripts &amp; Commands](#scripts--commands)
-- [Project Status](#project-status)
+When you're working with LLMs, context windows fill up fast — especially when tools are producing logs, JSON payloads, stack traces, or repetitive output. The easy fix is to just chop off the end, but that often throws away exactly what the model needs.
+
+TOON is smarter about it. Given a pile of tool output and a token budget, it:
+
+1. **Removes duplicates first** — exact copies, near-duplicates (same data but different timestamps/IDs), and repetitive log patterns are collapsed before anything else.
+2. **Scores what's left** — it figures out which entries are most important by looking at how central and relevant each one is to the rest of the corpus.
+3. **Compresses intelligently** — high-scoring content gets more budget; low-scoring content gets trimmed or dropped. Stack traces, JSON, logs, and plain text each get their own specialized compressor.
+
+The result is a context that fits in your budget while keeping the signal and cutting the noise.
 
 ---
 
-## What TOON Does
+## Quick Start
 
-When LLM context windows fill up with tool output, logs, or code, naive truncation discards the most useful information. TOON solves this by:
+### Python
 
-1. **Deduplicating** exact duplicates, near-duplicates (normalized UUIDs/timestamps/IPs), and repetitive template entries before any scoring begins.
-2. **Scoring** the remaining entries for centrality and relevance using graph-based (SageRank) and lexical (BMX+) algorithms — both custom successors to TextRank and BM25.
-3. **Compressing** each entry within a tiered token budget (`high`/`medium`/`low`/`cut`), applying content-aware strategies for stack traces, JSON blobs, log streams, and plain text.
-4. **Optionally using tree-sitter AST** structure to compress source-code files while preserving the most important symbol definitions.
+```bash
+git clone https://github.com/itstanner5216/toon.git
+cd toon/toon.py
 
----
-
-## Tech Stack
-
-| Layer | Python (`toon.py/`) | TypeScript (`toon.ts/`) |
-|---|---|---|
-| Language | Python 3.10+ | TypeScript 5.x, strict mode, ES2022 |
-| Build | [Hatchling](https://hatch.pypa.io/) (`pyproject.toml`) | `tsc` → `dist/` |
-| Module system | Package (`toon`, `engines`) | ESM, Node16 resolution |
-| Linting | [Ruff](https://docs.astral.sh/ruff/) | TypeScript compiler (`noUnusedLocals`, `noUnusedParameters`) |
-| Testing | [pytest](https://pytest.org/) + [rouge-score](https://pypi.org/project/rouge-score/) | Custom Node.js test harness (`--test`) |
-| Tree-sitter | `web-tree-sitter` WASM (via JS bridge) | `web-tree-sitter` (npm) |
-| Runtime deps | **Zero** | `web-tree-sitter` only |
-| Supported Python | 3.10, 3.11, 3.12, 3.13 | N/A |
-
----
-
-## Repository Structure
-
+# Install (no external runtime dependencies)
+pip install -e .
 ```
-toon/
-├── README.md                   ← This file
-├── SYMBOL_STRUCTURE_PLAN.md    ← Wave-based integration plan for AST scoring
-├── .gitignore
-│
-├── toon.py/                    ← Python implementation (v2.0.0, package: toon-plus)
-│   ├── pyproject.toml
-│   ├── ARCHITECTURE.md         ← Detailed Python architecture reference
-│   ├── toon/                   ← Core Python package
-│   │   ├── __init__.py         ← Public API: encode_output, compress, CompressConfig, TOONCompressor
-│   │   ├── __main__.py         ← CLI entry point (python -m toon)
-│   │   ├── pipeline.py         ← Three-stage orchestrator
-│   │   ├── config.py           ← ToonConfig dataclass hierarchy
-│   │   ├── presets.py          ← Pre-built configs (generic, codex_logs, mcp_responses, aggressive)
-│   │   ├── router.py           ← FieldMatcher predicate + route_field() dispatch
-│   │   ├── dedup.py            ← Three-tier deduplication
-│   │   ├── budget.py           ← Per-tier token budget allocation (60/30/10)
-│   │   ├── string_codec.py     ← Content-aware string compression (4 strategies)
-│   │   ├── encoder.py          ← v1 backward-compatible API + v2 pipeline delegate
-│   │   └── _utils.py           ← Pure functions (hashing, entropy, Gini, Kneedle, Pearson)
-│   ├── engines/                ← Standalone scoring engines
-│   │   ├── __init__.py
-│   │   ├── bmx_plus.py         ← BMX+ (entropy-weighted BM25 successor)
-│   │   ├── sagerank.py         ← SageRank (entropy-weighted TextRank successor)
-│   │   └── treesitter/         ← Tree-sitter bridge (JS, calls Python toon --structured)
-│   └── tests/
-│
-└── toon.ts/                    ← TypeScript implementation (v1.0.0)
-    ├── package.json
-    ├── tsconfig.json
-    ├── src/
-    │   ├── cli.ts              ← CLI entry point (toon binary)
-    │   ├── toon/               ← Core library (full port of toon.py)
-    │   │   ├── index.ts        ← Public API barrel
-    │   │   ├── pipeline.ts     ← Three-stage orchestrator
-    │   │   ├── config.ts       ← ToonConfig factories + defaults
-    │   │   ├── presets.ts      ← Pre-built configs
-    │   │   ├── router.ts       ← Field routing
-    │   │   ├── dedup.ts        ← Deduplication
-    │   │   ├── budget.ts       ← Budget allocation
-    │   │   ├── string-codec.ts ← Content-aware string compression
-    │   │   ├── bmx-plus.ts     ← BMX+ engine
-    │   │   ├── sagerank.ts     ← SageRank engine
-    │   │   ├── encoder.ts      ← v1 backward-compatible API
-    │   │   ├── utils.ts        ← Shared utilities
-    │   │   └── types.ts        ← TypeScript interfaces and type guards
-    │   └── engines/
-    │       ├── index.ts        ← Engines barrel
-    │       └── treesitter/
-    │           ├── tree-sitter.ts      ← Full tree-sitter wrapper (40+ languages)
-    │           ├── toon-bridge.ts      ← File → AST → compress (single binary)
-    │           └── web-tree-sitter.d.ts
-    ├── grammars/               ← 40+ language WASM grammars + query files (.scm)
-    └── tests/toon/
-        └── parity.test.ts      ← Python/TypeScript output parity tests
+
+```python
+from toon import compress, encode_output
+
+# One-liner: compress any tool output to a token budget
+result = compress(my_tool_output, budget=4000)
+
+# If you just want large arrays summarized (v1 behavior, unchanged):
+result = encode_output(my_tool_output, threshold=5)
+```
+
+### TypeScript
+
+```bash
+cd toon/toon.ts
+npm install
+npm run build
+```
+
+```typescript
+import { compress, encodeOutput } from 'toon';
+
+// Compress to a character budget
+const result = compress(myToolOutput, 4000);
+
+// Or just fold large arrays (v1 behavior):
+const result = encodeOutput(myToolOutput, 5);
 ```
 
 ---
 
-## Architecture Overview
+## How It Works
 
-### The Three-Stage Pipeline
+TOON runs three stages on your data:
 
-Both implementations share the same three-stage pipeline:
+**Stage 1 — Deduplication**
+Before scoring a single entry, TOON removes the noise:
+- *Exact duplicates*: identical entries are dropped immediately.
+- *Near-duplicates*: entries that differ only in timestamps, UUIDs, IP addresses, or numbers are recognized as the same thing and collapsed.
+- *Repetitive templates*: if you have 50 log lines that are all the same shape, they get folded into a "first + last + count" summary.
 
-```
-Input (any JSON-serializable data or list of entries)
-        │
-        ▼
-┌─────────────────────────────────────────────────┐
-│  Stage 1 — Structural Deduplication             │
-│                                                 │
-│  Tier 1 (Exact):     blake2b(canonical_json)    │
-│  Tier 2 (Near-dup):  normalize volatile fields  │
-│                      (timestamps, UUIDs, IPs,   │
-│                       numbers, base64) → hash   │
-│  Tier 3 (Template):  entries sharing schema     │
-│                      with >80% static values    │
-│                      → first + last + count     │
-│                                                 │
-│  LRU-bounded (5000), session or turn scoped     │
-└──────────────────────┬──────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────┐
-│  Stage 2 — Self-Scoring & Relevance Ranking     │
-│                                                 │
-│  n < 5:    bypass (preserve all)                │
-│  n ≤ 1000: SageRank full-graph centrality       │
-│            + BMX+ relevance against core        │
-│  n > 1000: SageRank on 500-entry sample         │
-│            + BMX+ scores all against core       │
-│                                                 │
-│  Gini guard (< 0.2) → uniform fallback          │
-│  Hubness detection (z > 3.0) → cap hub scores   │
-│  Kneedle knee-finding → adaptive core size      │
-│  Pearson r > 0.95 → drop redundant scores       │
-│                                                 │
-│  Tier assignment: high ≥ p75, medium ≥ p25,     │
-│                   low > 0, cut = 0              │
-└──────────────────────┬──────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────┐
-│  Stage 3 — Budget-Aware Compression             │
-│                                                 │
-│  5% reserved for structural overhead            │
-│  Remaining: 60% high / 30% medium / 10% low     │
-│  Within each tier: proportional to score        │
-│  "cut" tier: 0 tokens — excluded from output    │
-│                                                 │
-│  Per-entry dispatch:                            │
-│    template marker → structured annotation      │
-│    string  → content-aware codec                │
-│    dict    → field routing (preserve/encode)    │
-│    list    → TOON v1 array folding              │
-│    primitive → passthrough                      │
-└─────────────────────────────────────────────────┘
-```
+**Stage 2 — Scoring**
+The remaining entries are scored for importance. TOON builds a similarity graph across your data (using SageRank, a graph-ranking algorithm) and assigns relevance scores using BMX+, a lexical search engine. The highest-scoring entries are marked `high`; the lowest are marked `cut`.
 
-### Scoring Engines
+**Stage 3 — Compression**
+Budget is divided by tier: high-importance entries get 60% of the space, medium gets 30%, low gets 10%, and anything marked `cut` is dropped entirely. Each entry is then compressed using the right strategy for its content type:
 
-#### BMX+ (`bmx_plus.py` / `bmx-plus.ts`)
-
-Entropy-weighted lexical search — BM25 successor used for query→document relevance in Stage 2.
-
-**Core formula:**
-```
-score(q, d) = Σₜ∈q [ eIDF(t) · tf_sat(t,d) · qtf(t) · softAND ]
-
-eIDF(t) = IDF(t) · (1 + γₜ · info(t))
-γₜ      = IDF(t) / IDF_max          ← term-adaptive scaling
-info(t) = blend(shannon_info, idf_info, variance_weight)
-```
-
-**Key property:** Self-tuning. Rare terms receive maximum entropy boost; common terms receive minimal boost. No manual parameter tuning required.
-
-#### SageRank (`sagerank.py` / `sagerank.ts`)
-
-Entropy-weighted graph-based passage ranker — TextRank/LexRank successor for corpus centrality in Stage 2.
-
-**Five improvements over LexRank:**
-1. **Similarity kernel**: eIDF-weighted BM25-TF cosine (not plain TF-IDF)
-2. **Graph construction**: posting-list intersection O(V·posting²) — not O(N²·V)
-3. **Position prior**: self-tuning lead/trail bias from centrality distribution
-4. **Extraction**: coverage-optimized greedy (eIDF term coverage, not MMR)
-5. **Query mode**: optional BMX+ TAAT scoring biases PageRank personalization
-
-### String Codec
-
-Content-type detection dispatches to one of four specialized strategies:
-
-| Priority | Detected Type | Strategy |
-|---|---|---|
-| 1 | Stack trace | FaST-inspired frame scoring (ICSE 2022) — ranks by position × rarity |
-| 2 | JSON string | Depth-limited traversal — budget halves per level, key priority ordering |
-| 3 | Log output | Template-based dedup with severity priority (ERROR → WARN → INFO) |
-| 4 | Default | Adaptive head/tail truncation — 40/60 (error at tail), 80/20 (structure at head), or 50/50 |
-
-### Tree-sitter Integration
-
-The tree-sitter bridge enables **structure-aware source code compression**:
-
-- **40+ language grammars** (WASM): Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, C#, Ruby, Swift, Kotlin, Dart, Lua, Elixir, PHP, and more.
-- **Query files** (`.scm` patterns): per-language symbol definitions extracted by AST queries.
-- **Symbol extraction**: definitions, references, scopes, language injection regions.
-- **`compressSourceStructured()`**: allocates character budget to symbol blocks by priority — exported symbols and entry points are preserved; test/private helpers are cut first.
-
-**Bridge flow:**
-```
-file + budget
-    → tree-sitter AST parse (WASM)
-    → extract StructureBlock[] (name, kind, type, startLine, endLine)
-    → compressSourceStructured(content, budget, structure)
-    → compressed source output
-```
-
-The TypeScript `toon-bridge` binary is a self-contained single process. The Python version (`toon_bridge.js`) calls `python3 -m toon --structured` as a subprocess.
-
-### Configuration System
-
-```
-ToonConfig (master config — all fields have defaults)
-├── preserve_rules: FieldMatcher[]    ← never compress these fields
-├── encode_rules:   EncoderRule[]     ← first match wins
-│   └── EncoderRule = FieldMatcher + CodecConfig
-├── default_codec:  CodecConfig|None  ← fallback if no rule matches
-├── array:          ArrayCodecConfig  ← threshold, sample_size
-├── string:         StringCodecConfig ← budget, min_length, parse_json
-├── dedup:          DedupConfig       ← scope, maxsize
-└── bmx:            BMXConfig         ← enabled, mode, tiers
-```
-
-**Routing priority** (evaluated by `route_field`):
-1. `preserve_rules` — any match → `"preserve"` (never modified)
-2. `encode_rules` — first match → that rule's codec strategy
-3. `default_codec` — fallback
-4. → `"passthrough"`
+| Content type | What happens |
+|---|---|
+| Stack trace | Keeps the exception header + the most important frames; drops redundant library frames |
+| JSON string | Traverses depth-first, keeping the most important keys first |
+| Log output | Deduplicates repeated lines by pattern, fills space by severity (ERRORs first) |
+| Plain text | Adapts head/tail split based on where the interesting content tends to be |
 
 ---
 
 ## Features
 
-- **Three-stage pipeline** — dedup → scoring → budget-aware compression
-- **Zero runtime dependencies** (Python); only `web-tree-sitter` (TypeScript)
-- **Backward-compatible v1 API** — `encode_output(obj, threshold=5)` works unchanged
-- **Streaming mode** — `TOONCompressor.feed()` for real-time entry processing
-- **Configurable routing rules** — per-field compression strategies via `FieldMatcher`
-- **Four pre-built presets** — `generic`, `codex_logs`, `mcp_responses`, `aggressive`
-- **Content-aware string compression** — stack traces, JSON blobs, logs, plain text each get purpose-built codecs
-- **Structure-aware code compression** — AST-guided budget allocation via tree-sitter (40+ languages)
-- **Session-scoped deduplication** — LRU-bounded fingerprint cache across multiple calls
-- **Adaptive scoring** — Gini guard, hubness capping, Kneedle knee-finding all self-tune from corpus
-- **CLI** — stdin/stdout pipeline and structured (`--structured`) mode for both Python and TypeScript
+- ✅ Works on any JSON-serializable data — dicts, lists, strings, mixed structures
+- ✅ Zero runtime dependencies in Python (just the standard library)
+- ✅ Backward-compatible: existing `encode_output()` call sites work without changes
+- ✅ Streaming mode for processing entries one at a time
+- ✅ Source-code compression using tree-sitter AST (40+ languages)
+- ✅ Four ready-to-use presets for common scenarios
+- ✅ Fully configurable routing rules for per-field behavior
+- ✅ CLI for piping JSON through from the command line
+- ✅ Identical implementation in both Python and TypeScript, with parity tests
 
 ---
 
-## Getting Started
+## Presets
 
-### Python
+Don't want to configure anything? Pick a preset that fits your use case:
 
-**Requirements:** Python 3.10+, [`uv`](https://docs.astral.sh/uv/) or pip.
-
-```bash
-# Clone the repository
-git clone https://github.com/itstanner5216/toon.git
-cd toon/toon.py
-
-# Install with uv (recommended)
-uv sync
-
-# Or with pip
-pip install -e .
-
-# Run tests
-uv run pytest
-# or: python -m pytest
-```
-
-**Install dev dependencies** (linting + benchmarks):
-
-```bash
-uv sync --extra dev
-```
-
-### TypeScript
-
-**Requirements:** Node.js 18+, npm.
-
-```bash
-cd toon/toon.ts
-
-# Install dependencies
-npm install
-
-# Build
-npm run build
-
-# Run tests
-npm test
-```
-
-The compiled output lands in `dist/`. The `toon` and `toon-bridge` binaries are registered via the `bin` field in `package.json`.
-
----
-
-## API Reference
-
-### Python API
+| Preset | Best for | What it does |
+|---|---|---|
+| `generic` | Unknown/mixed payloads | Trims any string over 500 characters |
+| `codex_logs` | AI agent tool traces | Keeps `message` and `reasoning` untouched; trims `stdout`, `stderr`, and payload output |
+| `mcp_responses` | MCP tool responses | Preserves status, error, and ID fields; compresses large payloads |
+| `aggressive` | Maximum compression | Enables full scoring pipeline; trims all strings over 200 characters |
 
 ```python
-# ── Legacy v1 API (unchanged) ──────────────────────────────────────────────
-from toon import encode_output
-
-# Arrays > threshold are replaced with {__toon: true, count, sample}
-encoded = encode_output(tool_result, threshold=5)
-
-
-# ── Full pipeline v2 ────────────────────────────────────────────────────────
-from toon import compress
-
-# Budget in tokens; query biases relevance scoring
-compressed = compress(data, budget=4000, query="error timeout")
-
-
-# ── Full pipeline with config ───────────────────────────────────────────────
-from toon import compress, CompressConfig
-
-cfg = CompressConfig(gini_threshold=0.3, dedup_scope="turn")
-compressed = compress(data, budget=4000, config=cfg)
-
-
-# ── New config system (presets) ─────────────────────────────────────────────
+# Python
 from toon.config import ToonConfig
 
 cfg = ToonConfig.preset("codex_logs")
-cfg.string.default_budget = 600   # tweak after deep copy
+result = compress(tool_output, budget=4000, config=cfg)
+```
 
+```typescript
+// TypeScript
+import { toonConfigPreset, compress } from 'toon';
 
-# ── Streaming mode ───────────────────────────────────────────────────────────
+const cfg = toonConfigPreset('codex_logs');
+const result = compress(toolOutput, 4000, cfg);
+```
+
+---
+
+## Streaming Mode
+
+If you're processing entries one at a time (e.g. as tool calls come in), use the streaming compressor so deduplication state is maintained across entries:
+
+```python
 from toon import TOONCompressor
 
 compressor = TOONCompressor()
-for entry in stream:
-    out = compressor.feed(entry)   # returns None if deduped
-    if out is not None:
+
+for entry in tool_call_stream:
+    out = compressor.feed(entry)
+    if out is not None:          # None means it was a duplicate
         context.append(out)
-compressor.reset()                 # reset at session boundary
 
-
-# ── Standalone engines ───────────────────────────────────────────────────────
-from engines import BMXPlusIndex, SageRank
-
-# BMX+ lexical search
-index = BMXPlusIndex()
-index.build_index([{"chunk_id": "0", "text": "..."}, ...])
-results = index.search("query", top_k=10)   # → [(chunk_id, score), ...]
-
-# SageRank graph ranking
-sage = SageRank()
-result = sage.rank("long text", top_k=5, query="optional bias")
-result.summary           # selected sentences in document order
-result.scores            # PageRank scores per sentence
-result.selected_indices  # coverage-optimized selection
-result.keywords          # top terms by eIDF · √df
+compressor.reset()               # call this at the start of a new session
 ```
 
-### TypeScript API
+---
 
-```typescript
-import {
-  encodeOutput,          // v1 backward-compatible API
-  compress,              // v2 full pipeline
-  CompressConfig,
-  TOONCompressor,
-  BMXPlusIndex,
-  SageRank,
-  compressString,
-  compressSourceStructured,
-} from 'toon';
+## Source Code Compression
 
-// v1 array folding
-const encoded = encodeOutput(toolResult, 5);
+TOON can compress source code files intelligently by using the file's AST structure — instead of truncating blindly, it keeps exported functions and important entry points and trims private helpers and test functions first.
 
-// v2 full pipeline
-const compressed = compress(data, 4000);
+This requires the tree-sitter bridge, which supports 40+ languages including Python, TypeScript, JavaScript, Go, Rust, Java, C, C++, C#, Ruby, Swift, Kotlin, and more.
 
-// Structure-aware source compression (requires StructureBlock[])
-import type { StructureBlock } from 'toon';
-const result = compressSourceStructured(sourceCode, budgetChars, blocks);
+```bash
+# TypeScript: compress a file to a character budget
+toon-bridge path/to/file.py 8000
 
-// Tree-sitter integration (engines barrel)
-import { getDefinitions, getLangForFile, isSupported } from 'toon/engines';
+# Python version (calls toon --structured as a subprocess)
+node engines/treesitter/toon_bridge.js path/to/file.py 8000
 ```
 
 ---
 
 ## CLI
 
-### Python
+Both implementations expose a `toon` command that reads from stdin and writes to stdout:
 
 ```bash
-# Default mode — reads JSON from stdin, outputs compressed JSON
-echo '{"data": [...]}' | python -m toon
+# Compress JSON piped in
+echo '{"logs": [...]}' | python -m toon --budget 2000
 
-# With budget override
-echo '{"data": [...]}' | python -m toon --budget 2000
+# TypeScript (after npm run build)
+echo '{"logs": [...]}' | toon --budget 2000
 
-# Structured mode — reads {content, budget, structure} from stdin
+# Source-structured mode (pass content + structure as JSON)
 echo '{"content": "...", "budget": 1500}' | python -m toon --structured
 ```
 
-### TypeScript (after `npm run build`)
+**Flags:**
 
-```bash
-# Default mode
-echo '{"data": [...]}' | node dist/cli.js
-
-# Or via npm bin
-echo '{"data": [...]}' | toon --budget 2000
-
-# Structured mode
-echo '{"content": "...", "budget": 1500, "structure": [...]}' | toon --structured
-
-# Tree-sitter bridge — compress a source file to a character budget
-node dist/engines/treesitter/toon-bridge.js path/to/file.py 8000
-# or
-toon-bridge path/to/file.ts 4000
-```
-
-**CLI flags:**
-
-| Flag | Description |
+| Flag | What it does |
 |---|---|
-| `-h`, `--help` | Show help |
-| `--budget N` | Character/token budget override |
-| `--structured` | Structured mode: reads `{content, budget, structure}` JSON |
+| `--budget N` | Set a character/token budget |
+| `--structured` | Expect `{content, budget, structure}` JSON on stdin |
+| `-h` / `--help` | Show usage |
 
 ---
 
-## Configuration & Presets
+## Installation & Setup
 
-### Pre-built Presets
+### Python
 
-| Preset | Use case | Key settings |
-|---|---|---|
-| `generic` | Safe default for unknown payloads | Truncates strings ≥ 500 chars to 400 |
-| `codex_logs` | Codex/agent tool traces | Preserves `message`/`reasoning`; compresses `payload.output`, `stdout`, `stderr` |
-| `mcp_responses` | MCP tool responses | Preserves `error`, `status`, `id`, `type`; compresses payloads ≥ 1000 chars |
-| `aggressive` | Maximum compression | BMX+ scoring enabled; truncates all strings ≥ 200 chars to 200 |
-
-```python
-# Python
-from toon.config import ToonConfig
-cfg = ToonConfig.preset("codex_logs")
-
-# TypeScript
-import { toonConfigPreset } from 'toon';
-const cfg = toonConfigPreset('codex_logs');
-```
-
-### Key Parameters
-
-| Parameter | Default | Evidence Basis |
-|---|---|---|
-| Gini threshold | `0.2` | T-Retrievability, Ganguly 2025 (arXiv:2508.21704) |
-| Hubness z-threshold | `3.0` | Adversarial hubness, Cisco 2026 |
-| Redundancy r threshold | `0.95` | Engineering heuristic |
-| Kneedle sensitivity | `1.0` | Satopää et al. 2011, IEEE ICDCS |
-| Budget split | `60/30/10` | LLMLingua, ACL 2024 |
-| Overhead reserve | `5%` | Engineering heuristic |
-| Self/relevance blend | `0.4/0.6` | Engineering heuristic |
-| LRU maxsize | `5000` | ~500 KB, covers typical sessions |
-
----
-
-## Scripts & Commands
-
-### Python (`toon.py/`)
+**Requirements:** Python 3.10, 3.11, 3.12, or 3.13. No external runtime packages.
 
 ```bash
-# Install
-uv sync                    # production deps
-uv sync --extra dev        # + ruff, pytest, rouge-score
+cd toon/toon.py
 
-# Test
-uv run pytest              # run all tests
-python -m pytest tests/    # equivalent
+# Recommended (using uv)
+uv sync
+
+# Or with pip
+pip install -e .
+
+# Install dev tools (linter + test runner)
+uv sync --extra dev
+
+# Run tests
+uv run pytest
 
 # Lint
 uv run ruff check .
-uv run ruff format .
-
-# Run pipeline smoke test
-python -m toon.pipeline
-
-# Run SageRank standalone
-python test_sagerank.py
-
-# Run router self-test
-python -m toon.router
 ```
 
-### TypeScript (`toon.ts/`)
+### TypeScript
+
+**Requirements:** Node.js 18+. Only runtime dependency: `web-tree-sitter`.
 
 ```bash
-# Install
-npm install
+cd toon/toon.ts
 
-# Build (TypeScript → dist/)
-npm run build
-
-# Test
-npm test
-
-# Typecheck only (no emit)
-npx tsc --noEmit
+npm install          # install dependencies
+npm run build        # compile TypeScript → dist/
+npm test             # run parity tests
+npx tsc --noEmit     # type-check without compiling
 ```
 
 ---
 
-## Deployment
+## Project Layout
 
-TOON is a **library and CLI tool**, not a server. There is no Docker, CI/CD, or hosting configuration in the repository.
+```
+toon/
+├── toon.py/               Python package (toon-plus v2.0.0)
+│   ├── toon/              Core library: pipeline, dedup, scoring, codecs, config
+│   ├── engines/           Standalone scoring engines: BMX+ and SageRank
+│   │   └── treesitter/    Tree-sitter bridge (calls Python toon --structured)
+│   └── tests/
+│
+└── toon.ts/               TypeScript port (v1.0.0)
+    ├── src/toon/          Core library (full port of toon.py)
+    ├── src/engines/       Engines barrel + tree-sitter wrapper
+    ├── src/cli.ts         CLI entry point
+    ├── grammars/          40+ language WASM grammars and query files
+    └── tests/             Parity tests (Python ↔ TypeScript output matching)
+```
 
-**Python distribution:**
-- Package name: `toon-plus`
-- Build backend: [Hatchling](https://hatch.pypa.io/)
-- Packages included in wheel: `toon`, `engines`
-- `pyproject.toml` is configured for PyPI publication
-
-**TypeScript distribution:**
-- Configured as a private package (`"private": true`) — not published to npm
-- Binaries: `toon` (CLI), `toon-bridge` (tree-sitter bridge)
+For a deeper dive into the internals — algorithm details, configuration reference, and the parameter evidence table — see [ARCHITECTURE.md](toon.py/ARCHITECTURE.md).
 
 ---
 
 ## Project Status
 
-**Beta** — the core pipeline, both scoring engines, all four string codec strategies, and the tree-sitter integration are fully implemented in both Python and TypeScript. The TypeScript port mirrors the Python implementation and passes a cross-implementation parity test suite.
+**Beta.** The core pipeline, both scoring engines, all string codec strategies, and the tree-sitter integration are fully implemented in Python and TypeScript, with a parity test suite ensuring the two implementations stay in sync.
 
-Benchmark results from the tree-sitter bridge integration:
+Real-world compression results from the tree-sitter bridge:
 
-| File | Language | Original | Compressed | Retained |
-|---|---|---|---|---|
-| `pipeline.py` | Python | 28 927 B | 20 299 B | 70.1% |
-| `shared.js` | JavaScript | 16 400 B | 11 589 B | 70.6% |
-| `test-dcp-cache.sh` | Shell | 13 441 B | 8 384 B | 62.3% |
-| `index.ts` | TypeScript | 2 164 B | 2 163 B | 99.9% |
-| `package.json` | JSON | 2 268 B | 1 583 B | 69.7% |
+| File | Original size | Compressed | Retained |
+|---|---|---|---|
+| `pipeline.py` | 28,927 B | 20,299 B | 70% |
+| `shared.js` | 16,400 B | 11,589 B | 71% |
+| `test-dcp-cache.sh` | 13,441 B | 8,384 B | 62% |
+| `package.json` | 2,268 B | 1,583 B | 70% |
 
-All runs exited with code 0, respecting character budgets to within ±1%.
+All runs respected their character budgets to within ±1%.
 
-**Active development area:** Symbol-structure integration (SYMBOL_STRUCTURE_PLAN.md) — a planned wave of changes to replace name-only heuristics in the priority scorer with richer AST-derived structural signals from tree-sitter.
-
-**Invariants** (must hold across any refactoring):
-- `encode_output(obj, threshold=5)` produces identical output to v1
-- `compress()` always returns the same top-level type as input
-- `"preserve"` tier entries are never modified
-- `"cut"` tier entries are never included in output
-- Entry ordering in output matches input ordering
-- Zero external runtime dependencies (Python stdlib only + the three engines)
-- Empty input returns empty output (`[]` or `None`)
+**What's being actively worked on:** replacing the name-based symbol priority heuristic in the source-code compressor with richer signals derived directly from the AST — so the compressor can make smarter decisions about what to keep based on structure, not just function names.
 
