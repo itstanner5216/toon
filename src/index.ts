@@ -18,14 +18,16 @@
 // Source line-range pipeline entry point
 // ---------------------------------------------------------------------------
 // TODO(one-way-pipeline): export a single forward-only `compressSource(payload)`
-// entry once the engine chain is assembled (mechanical aggregate -> line-range
-// removal -> <6-line flag -> AST restructure -> render). Until that exists, the
-// individual source engines are exported below so callers can compose them.
-
-// ---------------------------------------------------------------------------
-// Source codec — the product: numbered lines + line-range truncation markers
-// ---------------------------------------------------------------------------
-export { compressSourceStructured } from './string-codec.js';
+// entry once the engine chain is assembled (rank -> mechanical aggregate ->
+// line-range removal -> <6-line flag -> AST restructure -> trivial gap render).
+//
+// The old `compressSourceStructured` (string-codec.ts) was the imposter source
+// path: a strip-then-re-derive line renderer wrapped around a hand-rolled regex
+// pseudo-AST scorer (_DEF_RE/_DECORATOR_RE anchors), frame/window placement, and
+// multi-pass run enforcement. The whole file was DELETED; a salvage pass proved
+// none of its "unique" pieces survive the pure-source / lines-only / no-fork /
+// no-marker / no-log rules. Nothing was recreated from it. Until the one-way
+// chain exists, the real engines are exported below so callers can compose them.
 
 // ---------------------------------------------------------------------------
 // Ranking engines — two distinct, complementary intelligences:
