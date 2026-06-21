@@ -1,9 +1,0 @@
-{
-  "name": "toon-treesitter-bridge",
-  "version": "1.0.0",
-  "type": "module",
-  "private": true,
-  "dependencies": {
-    "web-tree-sitter": "^0.26.8"
-  }
-}

@@ -1,0 +1,28 @@
+{
+  "name": "zenith-toon",
+  "version": "2026.1.14",
+  "description": "TOON compression codec library",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "clean": "shx rm -rf dist tsconfig.tsbuildinfo",
+    "build": "tsc --build",
+    "rebuild": "tsc --build --force"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.17",
+    "shx": "^0.3.4",
+    "typescript": "^5.8.2"
+  }
+}
