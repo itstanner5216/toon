@@ -15,19 +15,25 @@
 // forked, hand-rolled centrality scorer.
 
 // ---------------------------------------------------------------------------
-// Source line-range pipeline entry point
+// The single one-way route — entry point
 // ---------------------------------------------------------------------------
-// TODO(one-way-pipeline): export a single forward-only `compressSource(payload)`
-// entry once the engine chain is assembled (rank -> mechanical aggregate ->
-// line-range removal -> <6-line flag -> AST restructure -> trivial gap render).
+// `compressSource(payload)` is the one and only path through zenith-toon: a
+// linear (Payload) -> Payload chain (rank by centrality -> rank by relevance ->
+// mechanical aggregate -> line-range removal -> <6-line flag -> AST restructure
+// -> trivial gap render), terminating in a rendered string. No orchestrator, no
+// shared scorer, no back-edge — see compress-source.ts for the law it enforces.
 //
 // The old `compressSourceStructured` (string-codec.ts) was the imposter source
 // path: a strip-then-re-derive line renderer wrapped around a hand-rolled regex
 // pseudo-AST scorer (_DEF_RE/_DECORATOR_RE anchors), frame/window placement, and
 // multi-pass run enforcement. The whole file was DELETED; a salvage pass proved
 // none of its "unique" pieces survive the pure-source / lines-only / no-fork /
-// no-marker / no-log rules. Nothing was recreated from it. Until the one-way
-// chain exists, the real engines are exported below so callers can compose them.
+// no-marker / no-log rules. Nothing was recreated from it.
+//
+// Status: engine 1 (SageRank) is wired; later stages are documented pass-through
+// stubs, realized one at a time. The route runs end-to-end today.
+export { compressSource } from './compress-source.js';
+export type { Payload, SourceBlock, EngineRanking } from './compress-source.js';
 
 // ---------------------------------------------------------------------------
 // Ranking engines — two distinct, complementary intelligences:
