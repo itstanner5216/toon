@@ -8,6 +8,13 @@
  *   3. tanh Soft-AND coverage bonus (RankEvolve-inspired, anti-dominance)
  *
  * All executed within a TAAT posting-list architecture for 3.4–30× speedup.
+ *
+ * For the source route this is the lexical RELEVANCE engine: build the index
+ * once over code blocks (chunk_id = block/line-range id), search once with a
+ * scan query, read the ranking. The index is build-once / read-once — the
+ * incremental streaming API (updateIndex/removeFromIndex + lazy dirty-term
+ * recomputation) and the unused alpha/beta self-tuning knobs were removed;
+ * neither ever fed search().
  */
 
 // Module-level word regex
@@ -33,8 +40,6 @@ interface Chunk {
 
 export class BMXPlusIndex {
   // ── Public configuration ──
-  readonly alphaOverride: number | null;
-  readonly betaOverride: number | null;
   readonly normalizeScores: boolean;
 
   // ── Document storage ──
@@ -55,20 +60,11 @@ export class BMXPlusIndex {
   private _termTotalFreqs: Map<string, number>;
   private _termEntropy: Map<string, number>;
   private _termInfo: Map<string, number>;
-  private _dirtyTerms: Set<string>;
 
-  // ── Self-tuning parameters ──
-  private _alpha: number;
-  private _beta: number;
+  // ── Term-adaptive scaling ──
   private _idfMax: number;
 
-  constructor(
-    alphaOverride: number | null = null,
-    betaOverride: number | null = null,
-    normalizeScores: boolean = false
-  ) {
-    this.alphaOverride = alphaOverride;
-    this.betaOverride = betaOverride;
+  constructor(normalizeScores: boolean = false) {
     this.normalizeScores = normalizeScores;
 
     this._documents = new Map();
@@ -84,10 +80,7 @@ export class BMXPlusIndex {
     this._termTotalFreqs = new Map();
     this._termEntropy = new Map();
     this._termInfo = new Map();
-    this._dirtyTerms = new Set();
 
-    this._alpha = 1.0;
-    this._beta = 0.01;
     this._idfMax = 1.0;
   }
 
@@ -108,25 +101,10 @@ export class BMXPlusIndex {
   }
 
   // ════════════════════════════════════════════════════════════════════
-  //  Self-Tuning Parameters
+  //  Term-Adaptive Scaling
   // ════════════════════════════════════════════════════════════════════
 
-  private _computeParameters(): void {
-    const N = this._totalDocs;
-    const avgdl = this._avgDocLength;
-
-    this._alpha =
-      this.alphaOverride !== null
-        ? this.alphaOverride
-        : Math.max(0.5, Math.min(1.5, avgdl / 100.0));
-
-    this._beta =
-      this.betaOverride !== null
-        ? this.betaOverride
-        : N > 0
-        ? 1.0 / Math.log(1.0 + N)
-        : 0.01;
-
+  private _computeIdfMax(): void {
     // Compute IDF_max for term-adaptive scaling: γt = IDFt / IDF_max
     // Rare terms get full entropy weight, common terms get none,
     // independent of corpus size.
@@ -235,21 +213,6 @@ export class BMXPlusIndex {
     }
   }
 
-  /** Lazily recompute entropies only for dirty terms in the query. */
-  private _flushDirtyEntropies(queryTerms: Set<string>): void {
-    if (this._dirtyTerms.size === 0) return;
-    const toFlush: Set<string> = new Set();
-    for (const t of this._dirtyTerms) {
-      if (queryTerms.has(t)) toFlush.add(t);
-    }
-    if (toFlush.size > 0) {
-      this._computeTermEntropies(toFlush);
-      for (const t of toFlush) {
-        this._dirtyTerms.delete(t);
-      }
-    }
-  }
-
   // ════════════════════════════════════════════════════════════════════
   //  Build Index
   // ════════════════════════════════════════════════════════════════════
@@ -264,7 +227,6 @@ export class BMXPlusIndex {
     this._termTotalFreqs.clear();
     this._termEntropy.clear();
     this._termInfo.clear();
-    this._dirtyTerms.clear();
     this._avgDocLength = 0.0;
     this._totalDocs = 0;
     this._isBuilt = false;
@@ -316,7 +278,7 @@ export class BMXPlusIndex {
     }
 
     this._computeTermEntropies(); // also populates _idfCache
-    this._computeParameters();    // uses _idfCache for _idfMax
+    this._computeIdfMax();        // uses _idfCache for _idfMax
     this._isBuilt = true;
   }
 
@@ -343,8 +305,6 @@ export class BMXPlusIndex {
     }
     const uniqueQuery = new Set(queryTokens);
     const m = uniqueQuery.size;
-
-    this._flushDirtyEntropies(uniqueQuery);
 
     // Cache locals for the hot loop
     const k1 = 1.5;
@@ -427,128 +387,5 @@ export class BMXPlusIndex {
     }
 
     return finalScores.slice(0, topK);
-  }
-
-  // ════════════════════════════════════════════════════════════════════
-  //  Incremental Updates
-  // ════════════════════════════════════════════════════════════════════
-
-  /** Add or replace a document (lazy entropy recomputation). */
-  updateIndex(chunkId: string, text: string): void {
-    if (this._documents.has(chunkId)) {
-      this.removeFromIndex(chunkId);
-    }
-
-    const tokens = BMXPlusIndex._tokenize(text);
-    this._documents.set(chunkId, tokens);
-    this._docLengths.set(chunkId, tokens.length);
-
-    // Counter equivalent
-    const termCounts = new Map<string, number>();
-    for (const token of tokens) {
-      termCounts.set(token, (termCounts.get(token) ?? 0) + 1);
-    }
-    const affected: Set<string> = new Set();
-
-    for (const [term, count] of termCounts.entries()) {
-      if (!this._postingLists.has(term)) {
-        this._postingLists.set(term, new Map());
-      }
-      this._postingLists.get(term)!.set(chunkId, count);
-
-      this._docFreqs.set(term, (this._docFreqs.get(term) ?? 0) + 1);
-      this._termTotalFreqs.set(
-        term,
-        (this._termTotalFreqs.get(term) ?? 0) + count
-      );
-      affected.add(term);
-    }
-
-    this._totalDocs = this._documents.size;
-    let totalLen = 0;
-    for (const l of this._docLengths.values()) totalLen += l;
-    this._avgDocLength = totalLen / this._totalDocs;
-    this._computeParameters();
-    for (const t of affected) this._dirtyTerms.add(t);
-  }
-
-  /** Remove a document (lazy entropy recomputation). */
-  removeFromIndex(chunkId: string): void {
-    if (!this._documents.has(chunkId)) return;
-
-    const tokens = this._documents.get(chunkId)!;
-    // Counter equivalent
-    const termCounts = new Map<string, number>();
-    for (const token of tokens) {
-      termCounts.set(token, (termCounts.get(token) ?? 0) + 1);
-    }
-    const affected: Set<string> = new Set();
-
-    for (const [term, count] of termCounts.entries()) {
-      const posting = this._postingLists.get(term);
-      if (posting && posting.has(chunkId)) {
-        posting.delete(chunkId);
-        if (posting.size === 0) {
-          this._postingLists.delete(term);
-        }
-      }
-
-      const newDf = Math.max((this._docFreqs.get(term) ?? 1) - 1, 0);
-      this._docFreqs.set(term, newDf);
-      if (newDf === 0) {
-        this._docFreqs.delete(term);
-        this._idfCache.delete(term);
-        this._termEntropy.delete(term);
-        this._termInfo.delete(term);
-      }
-
-      const newTtf = Math.max(
-        (this._termTotalFreqs.get(term) ?? count) - count,
-        0
-      );
-      this._termTotalFreqs.set(term, newTtf);
-      if (newTtf === 0) {
-        this._termTotalFreqs.delete(term);
-      }
-
-      affected.add(term);
-    }
-
-    this._documents.delete(chunkId);
-    this._docLengths.delete(chunkId);
-
-    this._totalDocs = this._documents.size;
-    if (this._totalDocs > 0) {
-      let totalLen = 0;
-      for (const l of this._docLengths.values()) totalLen += l;
-      this._avgDocLength = totalLen / this._totalDocs;
-    } else {
-      this._avgDocLength = 0.0;
-    }
-    this._computeParameters();
-    for (const t of affected) this._dirtyTerms.add(t);
-  }
-
-  // ════════════════════════════════════════════════════════════════════
-  //  Properties
-  // ════════════════════════════════════════════════════════════════════
-
-  get documentCount(): number {
-    return this._totalDocs;
-  }
-
-  get vocabularySize(): number {
-    return this._postingLists.size;
-  }
-
-  getStats(): Record<string, unknown> {
-    return {
-      total_docs: this._totalDocs,
-      vocabulary_size: this.vocabularySize,
-      avg_doc_length: Math.round(this._avgDocLength * 100) / 100,
-      alpha: Math.round(this._alpha * 10000) / 10000,
-      beta: Math.round(this._beta * 10000) / 10000,
-      idf_max: Math.round(this._idfMax * 10000) / 10000,
-    };
   }
 }
