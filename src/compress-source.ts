@@ -30,15 +30,15 @@
 // else, so there is no cycle to "solve" and no shared scorer to extract.
 
 import { SageRank } from './sagerank.js';
-// Engine 2 (BMX+) is wired in the next step; import it then to keep this file
-// free of unused symbols:
-//   import { BMXPlusIndex } from './bmx-plus.js';
+import { BMXPlusIndex } from './bmx-plus.js';
+import { findKneedle } from './utils.js';
 //
 // NOTE on AST: a `SourceBlock` below is the pure-source projection of Zenith's
 // richer `StructureBlock` (./types.js) — same line range, plus (later) parent
-// symbol, anchors, kind, and the call-graph `ASTEdge[]` that feed
-// SageRank.rankWithAST. We deliberately do NOT import those AST shapes yet; the
-// text-only route needs only the line range + text.
+// symbol, anchors, kind, and the call-graph `ASTEdge[]`. The text-only route
+// needs only the line range + text; AST facts arrive later and plug into
+// engine 2's QueryBundle (as lexical query material) and stage 1's rankWithAST
+// seam — never into a forked scorer.
 
 // ---------------------------------------------------------------------------
 // The payload — the single object that flows through every stage.
@@ -136,27 +136,126 @@ export function rankByCentrality(payload: Payload): Payload {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 2 — BMX+: lexical relevance.   [TODO — wire next, identical pattern]
+// Stage 2 — BMX+: lexical / source relevance.   [WIRED]
 // ---------------------------------------------------------------------------
 
 /**
- * TODO(stage-2): feed the same blocks into BMX+ and append its ranking.
+ * The lexical material BMX+ is pointed at. BMX+ does NOT "know importance" on
+ * its own — it is a search engine. Its job is to answer "which candidate blocks
+ * actually contain the named/lexical evidence of what we care about." So we feed
+ * it the richest query we can assemble, from two categories (one BMX+ index
+ * serves both — "use BMX twice conceptually, one implementation"):
  *
- * Pattern (identical in spirit to stage 1 — feed, read, append):
- *   1. const idx = new BMXPlusIndex();
- *   2. idx.buildIndex(blocks.map((b, i) => ({ chunk_id: String(i), text: b.text })));
- *   3. const ranked = idx.search(payload.query ?? <scan query>, n);  // [chunk_id, score][]
- *   4. map chunk_id back to block index, fill a length-n score array,
- *      take the bottom ~30% as leastUseful, append as EngineRanking.
+ *   • SAGE-SYNERGY — the text of the blocks SageRank ranked most central, read
+ *     forward off engine 1's ranking that already rides the payload. ("Which
+ *     blocks resemble the structural core?")
+ *   • REAL-INTENT — the actual lexical/source signals naming the thing the scan
+ *     cares about. ("Which blocks contain that named evidence?")
  *
- * Open question to resolve when wiring: what query drives a no-target "scan"?
- * BMX+ relevance is query-conditioned; a pure scan has no query. Likely the
- * scan request supplies it (symbols/intent of interest). Until then this is a
- * pass-through so the route stays runnable and honest about what is real.
+ * This bundle is the integration seam for Kimi's translated AST facts: every
+ * real-intent slot below is a socket where a Zenith-supplied fact (symbol /
+ * import / call name, module path, test name, diagnostic) plugs straight into
+ * the query — shaping BMX+'s INPUT so the real engine produces a source-aware
+ * ranking by itself. It is forward-only (sage-synergy comes from engine 1;
+ * real-intent rides in with the source) and it SCORES NOTHING — it is query text.
+ *
+ * Three engines, three distinct teeth in one gear (not redundant):
+ *   SageRank = structural centrality · AST = code topology · BMX+ = lexical evidence.
+ */
+interface QueryBundle {
+  // sage-synergy (wired now: derived from engine 1's forward ranking)
+  sageCoreText: string;
+  // real-intent (scanQuery wired now; the rest arrive from Zenith's AST DB)
+  scanQuery: string | null;
+  // TODO(zenith/ast): populate from StructureBlock / ASTEdge once Zenith
+  // supplies them — each is its own lexical slot so AST facts plug straight in.
+  symbolNames?: string[];      // function / class / type / variable names
+  imports?: string[];          // imported module + symbol names
+  exports?: string[];          // exported symbol names
+  callNeighbors?: string[];    // names of call-graph-adjacent symbols
+  modulePath?: string | null;  // file / module path context
+  testNames?: string[];        // associated test / spec names
+  diagnostics?: string[];      // diagnostic / error identifiers touching these blocks
+}
+
+/** Flatten the populated bundle slots into one query string. Concatenation of
+ *  query material only — it does NOT score or rank. */
+function bundleToQuery(b: QueryBundle): string {
+  const parts: string[] = [b.sageCoreText];
+  if (b.scanQuery) parts.push(b.scanQuery);
+  if (b.symbolNames?.length) parts.push(b.symbolNames.join(' '));
+  if (b.imports?.length) parts.push(b.imports.join(' '));
+  if (b.exports?.length) parts.push(b.exports.join(' '));
+  if (b.callNeighbors?.length) parts.push(b.callNeighbors.join(' '));
+  if (b.modulePath) parts.push(b.modulePath);
+  if (b.testNames?.length) parts.push(b.testNames.join(' '));
+  if (b.diagnostics?.length) parts.push(b.diagnostics.join(' '));
+  return parts.filter((s) => s.length > 0).join(' ');
+}
+
+/**
+ * Feed the candidate blocks into BMX+ and append its relevance ranking.
+ *
+ * Same law as stage 1 — FEED the real engine, READ its scores, APPEND forward.
+ * Build BMX+'s index over the candidate blocks (chunk_id = block index),
+ * assemble the query bundle, run the engine's real `search`, then take the
+ * bottom ~30% of the engine's OWN order as this engine's cut nomination.
+ *
+ * TODO(scoring-phase): one combined search over the bundle (current) vs. two
+ * focused searches (sage-synergy vs. real-intent) blended — a tuning call that
+ * belongs with the scoring iteration, deliberately deferred (not now).
  */
 export function rankByRelevance(payload: Payload): Payload {
-  // TODO(stage-2): wire BMXPlusIndex.buildIndex/search; append EngineRanking.
-  return payload;
+  const blocks = payload.blocks;
+  const n = blocks.length;
+  if (n === 0) return payload;
+
+  // Candidate units = the payload's blocks (once Zenith supplies symbol/doc
+  // units they arrive AS blocks). chunk_id is the block index, as a string.
+  const idx = new BMXPlusIndex();
+  idx.buildIndex(blocks.map((b, i) => ({ chunk_id: String(i), text: b.text })));
+
+  // Sage-synergy: read forward off engine 1's ranking. Find the Kneedle elbow of
+  // SageRank's OWN score curve (selection by reading — no re-scoring), then join
+  // the core blocks' text as query material.
+  let sageCoreText = '';
+  const sage = payload.rankings.find((r) => r.engine === 'SageRank');
+  if (sage && sage.scores.length > 0) {
+    const coreOrder = [...sage.scores.keys()].sort(
+      (a, b) => (sage.scores[b] ?? 0) - (sage.scores[a] ?? 0), // descending: core first
+    );
+    const knee = findKneedle(coreOrder.map((i) => sage.scores[i] ?? 0));
+    const coreIdx = coreOrder.slice(0, Math.max(1, knee));
+    sageCoreText = coreIdx.map((i) => blocks[i]?.text ?? '').join(' ');
+  }
+
+  const bundle: QueryBundle = {
+    sageCoreText,
+    scanQuery: payload.query,
+    // TODO(zenith/ast): fill symbolNames/imports/exports/callNeighbors/
+    // modulePath/testNames/diagnostics from Zenith's translated facts.
+  };
+
+  // Feed the real engine; read its scores back, index-aligned to blocks.
+  const ranked = idx.search(bundleToQuery(bundle), n); // [chunk_id, score][]
+  const scores = new Array<number>(n).fill(0);
+  for (const [cid, score] of ranked) {
+    const i = Number(cid);
+    if (Number.isInteger(i) && i >= 0 && i < n) scores[i] = score;
+  }
+
+  // Least-useful ~30% = the tail of BMX+'s OWN order (inlined per-engine; no
+  // selection code is shared, so nothing can congeal into a cross-engine fork).
+  const order = [...scores.keys()].sort(
+    (a, b) => (scores[a] ?? 0) - (scores[b] ?? 0), // ascending: worst first
+  );
+  const cutCount = Math.floor(order.length * CUT_FRACTION);
+  const leastUseful = order.slice(0, cutCount);
+
+  return {
+    ...payload,
+    rankings: [...payload.rankings, { engine: 'BMX+', scores, leastUseful }],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -268,15 +367,16 @@ export function renderWithGapMarkers(payload: Payload): string {
  * (Payload) -> Payload stages with one terminal render. There is no other path,
  * by design.
  *
- * Status: engine 1 (SageRank) is wired and produces a real ranking on the
- * payload; every later stage is a documented pass-through stub, realized one at
- * a time. The route runs end-to-end today and returns the source unchanged
- * (nothing is cut until aggregation + removal are wired).
+ * Status: engines 1-2 (SageRank + BMX+) are wired and each append a real
+ * ranking to the payload; the mechanical/AST/render stages are documented
+ * pass-through stubs, realized one at a time. The route runs end-to-end today
+ * and returns the source unchanged (nothing is cut until aggregation + removal
+ * are wired).
  */
 export function compressSource(payload: Payload): string {
   let p = payload;
   p = rankByCentrality(p);       // engine 1 — SageRank (structural centrality)   [WIRED]
-  p = rankByRelevance(p);        // engine 2 — BMX+ (lexical relevance)            [TODO]
+  p = rankByRelevance(p);        // engine 2 — BMX+ (lexical relevance)           [WIRED]
   p = aggregateLeastUseful(p);   // mechanical: collective bottom-~30% line ranges [TODO]
   p = removeLineRanges(p);       // mechanical: delete those ranges, leave gaps    [TODO]
   p = flagSmallBlocks(p);        // mechanical: mark blocks < 6 lines for stage 6  [TODO]
