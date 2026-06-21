@@ -15,43 +15,11 @@ function _fastSigmoid(x: number): number {
   return (x3 + 6.0 * x + 12.0) / (x3 + 12.0 * x + 48.0);
 }
 
-function _segmentSentences(text: string, minLength: number = 10): string[] {
-  // Rule-based sentence segmentation. No dependencies.
-  // Handles paragraphs, line-per-message logs, and standard prose.
-  const trimmed = text.trim();
-  if (trimmed.length === 0) return [];
-
-  const raw: string[] = [];
-  const blocks = trimmed.split(/\n\s*\n/);
-  for (const rawBlock of blocks) {
-    const block = rawBlock.trim();
-    if (block.length === 0) continue;
-    for (const rawLine of block.split("\n")) {
-      const line = rawLine.trim();
-      if (line.length === 0) continue;
-      // Split on sentence-ending punctuation followed by space + capital
-      const parts = line.split(/(?<=[.!?])\s+(?=[A-Z"])/);
-      for (const rawP of parts) {
-        const p = rawP.trim();
-        if (p.length > 0) raw.push(p);
-      }
-    }
-  }
-
-  if (raw.length === 0) return [];
-
-  // Merge very short fragments with previous sentence
-  const merged: string[] = [raw[0]!];
-  for (let i = 1; i < raw.length; i++) {
-    const lastIdx = merged.length - 1;
-    if (merged[lastIdx]!.length < minLength) {
-      merged[lastIdx] = merged[lastIdx]! + " " + raw[i]!;
-    } else {
-      merged.push(raw[i]!);
-    }
-  }
-  return merged;
-}
+// NOTE: the prose-era text wrappers (_segmentSentences + rank/summarize/
+// extractKeywords/rankPassages) were removed. They segmented free prose into
+// sentences — log/tool-output heritage that has no meaning for line-numbered
+// source. The source route feeds SageRank pre-segmented line-blocks directly
+// via rankSentences / rankWithAST; nothing here splits text into "sentences".
 
 // ════════════════════════════════════════════════════════════════════════
 //  Result
@@ -115,7 +83,6 @@ export class SageRank {
   private readonly _maxIter: number;
   private readonly _epsilon: number;
   private readonly _coverageWeight: number;
-  private readonly _minSentLen: number;
   private readonly _normalize: boolean;
 
   constructor(
@@ -125,7 +92,6 @@ export class SageRank {
     maxIter: number = 50,
     epsilon: number = 1e-6,
     coverageWeight: number = 0.5,
-    minSentenceLength: number = 10,
     normalize: boolean = true,
   ) {
     this._k1 = k1;
@@ -134,7 +100,6 @@ export class SageRank {
     this._maxIter = maxIter;
     this._epsilon = epsilon;
     this._coverageWeight = coverageWeight;
-    this._minSentLen = minSentenceLength;
     this._normalize = normalize;
   }
 
@@ -686,12 +651,14 @@ export class SageRank {
   //  Public API
   // ════════════════════════════════════════════════════════════════
 
+  // Rank pre-segmented units (for the source route: line-blocks, each carrying
+  // its own line range). The caller supplies the units already split; SageRank
+  // never re-segments. Returns per-unit centrality scores + a selected core.
   rankSentences(
     sentences: string[],
     topK: number = 5,
     query: string | null = null,
   ): SageResult {
-    // Rank pre-segmented sentences/passages/messages.
     const n = sentences.length;
     if (n === 0) {
       return makeSageResult([], [], [], [], {});
@@ -808,55 +775,6 @@ export class SageRank {
     return makeSageResult(sentences, scores, selected, keywords, stats);
   }
 
-  // Alias for non-sentence text units (messages, paragraphs, chunks)
-  rankPassages(
-    sentences: string[],
-    topK: number = 5,
-    query: string | null = null,
-  ): SageResult {
-    return this.rankSentences(sentences, topK, query);
-  }
-
-  rank(
-    text: string,
-    topK: number = 5,
-    query: string | null = null,
-  ): SageResult {
-    // Rank sentences in a text document.
-    // Segments text into sentences, then ranks them.
-    const sentences = _segmentSentences(text, this._minSentLen);
-    return this.rankSentences(sentences, topK, query);
-  }
-
-  summarize(
-    text: string,
-    ratio: number = 0.3,
-    query: string | null = null,
-  ): string {
-    // Return an extractive summary at the given compression ratio.
-    const sentences = _segmentSentences(text, this._minSentLen);
-    if (sentences.length === 0) return "";
-    const topK = Math.max(1, Math.floor(sentences.length * ratio));
-    const result = this.rankSentences(sentences, topK, query);
-    return result.summary;
-  }
-
-  extractKeywords(
-    text: string,
-    topK: number = 10,
-  ): [string, number][] {
-    // Extract top keywords using entropy-weighted IDF scoring.
-    // Returns list of [term, score] tuples sorted by importance.
-    const sentences = _segmentSentences(text, this._minSentLen);
-    if (sentences.length === 0) return [];
-    const sentTokens = sentences.map((s) => SageRank._tokenize(s));
-    const [postingLists, docFreqs] =
-      SageRank._buildPostingLists(sentTokens);
-    const n = sentences.length;
-    const [, eidf] = SageRank._computeEidf(postingLists, docFreqs, n);
-    return SageRank._getKeywords(eidf, docFreqs, topK);
-  }
-
   // ════════════════════════════════════════════════════════════════
   //  AST-Aware Ranking (Call Graph Integration)
   // ════════════════════════════════════════════════════════════════
@@ -864,7 +782,7 @@ export class SageRank {
   /**
    * Merge AST edges into text-similarity adjacency graph.
    * AST edges represent call/reference relationships from the symbol index.
-   * 
+   *
    * @param textAdjacency - Adjacency from text similarity
    * @param astEdges - Edges from call graph / symbol references
    * @param n - Number of nodes
@@ -910,13 +828,13 @@ export class SageRank {
 
   /**
    * Rank sentences/blocks with AST call graph awareness.
-   * 
+   *
    * Uses the existing text-similarity graph but augments it with edges
    * from the symbol index call graph. This means:
    * - Functions that call many others have high out-degree → authority
    * - Functions called by many others have high in-degree → hub
    * - Bridge functions connecting clusters have high betweenness
-   * 
+   *
    * @param sentences - Text content of each block/function
    * @param topK - Number of top items to select
    * @param astEdges - Call graph edges from symbol index
@@ -933,10 +851,10 @@ export class SageRank {
       return makeSageResult([], [], [], [], { ast_aware: true, ast_edges: 0 });
     }
     if (n === 1) {
-      return makeSageResult(sentences, [1.0], [0], [], { 
-        sentences: 1, 
-        ast_aware: true, 
-        ast_edges: astEdges.length 
+      return makeSageResult(sentences, [1.0], [0], [], {
+        sentences: 1,
+        ast_aware: true,
+        ast_edges: astEdges.length
       });
     }
     const effectiveTopK = Math.min(topK, n);
