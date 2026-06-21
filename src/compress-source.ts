@@ -31,7 +31,7 @@
 
 import { SageRank } from './sagerank.js';
 import { BMXPlusIndex } from './bmx-plus.js';
-import { findKneedle } from './utils.js';
+import { findKneedle, pearsonR } from './utils.js';
 //
 // NOTE on AST: a `SourceBlock` below is the pure-source projection of Zenith's
 // richer `StructureBlock` (./types.js) — same line range, plus (later) parent
@@ -73,19 +73,55 @@ export interface EngineRanking {
   readonly leastUseful: readonly number[]; // block indices this engine nominates to cut (~bottom 30%)
 }
 
+/** A contiguous span of source lines — the unit of removal. */
+export interface LineRange {
+  readonly startLine: number;  // 1-based inclusive
+  readonly endLine: number;    // 1-based inclusive
+}
+
 /**
- * The payload. Flows through the route unchanged except that `rankings` grows
- * by exactly one entry per engine. Stages return a NEW payload — no mutable
- * shared state is threaded between them.
+ * A pearsonR reading between two engines' usefulness curves. This is a MONITOR,
+ * not a judge: it rides forward as an observation and NEVER weights, drops, or
+ * otherwise overrules any engine. Nothing we have built is intelligent enough to
+ * declare that two engines agreeing is "wrong" — so correlation is watched, not
+ * acted on ("until proven otherwise").
+ */
+export interface EnginePairCorrelation {
+  readonly engineA: string;
+  readonly engineB: string;
+  readonly r: number;  // observed correlation; informational only
+}
+
+/**
+ * Output of the mechanical aggregation stage (stage 3). This stage IS the
+ * keep/drop decision — the only one — but it is purely mechanical: it sums the
+ * engines' equally-weighted verdicts into one final score per block the same way
+ * every time, and drops the least-informative ~30% of the file.
+ */
+export interface Aggregation {
+  readonly doomedRanges: readonly LineRange[];               // the least-useful ~30% to cut
+  readonly finalScores: readonly number[];                   // index-aligned equal-weight fused usefulness
+  readonly correlationMonitor: readonly EnginePairCorrelation[]; // pearsonR readings — monitor only
+}
+
+/**
+ * The payload. Flows through the route, growing only by appended forward
+ * metadata: `rankings` grows by one entry per engine; `aggregation` is set once
+ * by stage 3. Stages return a NEW payload — no mutable shared state.
  */
 export interface Payload {
   readonly blocks: readonly SourceBlock[];       // numbered source, never re-derived
   readonly rankings: readonly EngineRanking[];   // append-only; one per engine, in route order
-  readonly charBudget: number;                   // the target the cut must hit (chars)
+  readonly charBudget: number;                   // the target the final AST stage restructures within (chars)
   readonly query: string | null;                 // scan focus; biases the relevance engines
+  readonly aggregation?: Aggregation;            // set by stage 3; consumed by stage 4
 }
 
-/** Each engine independently nominates roughly this fraction as least-useful. */
+/**
+ * The least-useful fraction. Each engine nominates ~this much as its own bottom
+ * tail; aggregation drops ~this much of the FILE (by line count). One constant,
+ * one meaning of "30%", everywhere.
+ */
 const CUT_FRACTION = 0.30;
 
 // ---------------------------------------------------------------------------
@@ -259,24 +295,110 @@ export function rankByRelevance(payload: Payload): Payload {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3 — Mechanical aggregation.   [TODO]   (NOT a decision step)
+// Stage 3 — Mechanical aggregation.   [WIRED]   (the only keep/drop decision)
 // ---------------------------------------------------------------------------
 
+/** Min-max normalize a score curve to [0,1] usefulness, so every engine is
+ *  compared on a common scale before EQUAL-weight fusion. A flat curve (no
+ *  signal) maps to all zeros. Pure; deterministic; scores nothing. */
+function normalize01(scores: readonly number[]): number[] {
+  if (scores.length === 0) return [];
+  let min = Infinity;
+  let max = -Infinity;
+  for (const s of scores) {
+    if (s < min) min = s;
+    if (s > max) max = s;
+  }
+  const range = max - min;
+  if (range < 1e-12) return scores.map(() => 0);
+  return scores.map((s) => (s - min) / range);
+}
+
 /**
- * TODO(stage-3): pure math over `payload.rankings` → the line ranges to cut.
+ * Aggregate the engines' rankings into the keep/drop decision. This stage
+ * consults NO engine and applies NO intelligence of its own — it sums verdicts.
  *
- * This is explicitly NOT a decision step and consults NO engine. Every prior
- * engine already chose its least-useful blocks WITH its own intelligence
- * (centrality, relevance, and — once integrated — AST awareness baked into
- * those scores). This stage only computes where the engines COLLECTIVELY ranked
- * the bottom ~30%: combine the per-engine score curves / `leastUseful` sets
- * mathematically (e.g. agreement + normalized rank), map the agreed-cut block
- * indices to their `startLine..endLine` ranges, and record those ranges. No new
- * scoring; just aggregation of rankings that already exist on the payload.
+ * EQUAL WEIGHTING: each engine's score curve is put on a common [0,1] scale and
+ * averaged with equal weight. No engine is discounted. Agreement is a STRONG
+ * SIGNAL by construction — blocks every engine scores high stay high, blocks
+ * every engine scores low sink low, disagreement lands in the uncertain middle.
+ * We never suppress agreement: nothing here is smart enough to declare that two
+ * intelligent engines agreeing is somehow wrong.
+ *
+ * pearsonR IS A MONITOR, NOT A JUDGE: pairwise correlation is observed and
+ * carried forward as a reading, but it never weights, drops, or alters anything.
+ *
+ * THE DECISION: drop the least-informative ~30% of the FILE (by line count).
+ * Sort blocks ascending by the final score and remove whole line-ranges until
+ * ~30% of the source's lines are gone. Computed the same exact way every time
+ * (deterministic; stable ties). Gap/marker logic is NOT this step's concern.
  */
 export function aggregateLeastUseful(payload: Payload): Payload {
-  // TODO(stage-3): combine payload.rankings → doomed line ranges (pure math).
-  return payload;
+  const blocks = payload.blocks;
+  const n = blocks.length;
+  const k = payload.rankings.length;
+  if (n === 0 || k === 0) {
+    return {
+      ...payload,
+      aggregation: { doomedRanges: [], finalScores: [], correlationMonitor: [] },
+    };
+  }
+
+  // 1. Put every engine on a common [0,1] scale so equal weighting is fair.
+  const curves = payload.rankings.map((r) => normalize01(r.scores));
+
+  // 2. Final score per block = EQUAL-weight mean across engines. Same math,
+  //    every time. The engines decide; this only adds their verdicts up.
+  const finalScores: number[] = new Array<number>(n).fill(0);
+  for (let b = 0; b < n; b++) {
+    let acc = 0;
+    for (let i = 0; i < k; i++) acc += curves[i]?.[b] ?? 0;
+    finalScores[b] = acc / k;
+  }
+
+  // 3. Monitor only: observe how correlated each engine pair is. Never acted on.
+  const correlationMonitor: EnginePairCorrelation[] = [];
+  for (let i = 0; i < k; i++) {
+    for (let j = i + 1; j < k; j++) {
+      correlationMonitor.push({
+        engineA: payload.rankings[i]?.engine ?? `engine${i}`,
+        engineB: payload.rankings[j]?.engine ?? `engine${j}`,
+        r: pearsonR(curves[i] ?? [], curves[j] ?? []),
+      });
+    }
+  }
+
+  // 4. The only keep/drop decision: drop the least-informative ~30% of the file
+  //    by line count. Whole line-ranges, ascending by final score.
+  let totalLines = 0;
+  for (const blk of blocks) totalLines += blk.endLine - blk.startLine + 1;
+  const lineQuota = Math.floor(totalLines * CUT_FRACTION);
+
+  const doomedRanges: LineRange[] = [];
+  if (lineQuota > 0) {
+    const order = [...finalScores.keys()].sort(
+      (a, b) => (finalScores[a] ?? 0) - (finalScores[b] ?? 0), // ascending: least useful first
+    );
+    let dropped = 0;
+    const doomedIdx: number[] = [];
+    for (const bi of order) {
+      if (dropped >= lineQuota) break;
+      const blk = blocks[bi];
+      if (blk === undefined) continue;
+      doomedIdx.push(bi);
+      dropped += blk.endLine - blk.startLine + 1;
+    }
+    doomedIdx
+      .map((bi) => blocks[bi])
+      .filter((b): b is SourceBlock => b !== undefined)
+      .sort((a, b) => a.startLine - b.startLine)
+      .forEach((b) => doomedRanges.push({ startLine: b.startLine, endLine: b.endLine }));
+  }
+
+  return {
+    ...payload,
+    aggregation: { doomedRanges, finalScores, correlationMonitor },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +406,9 @@ export function aggregateLeastUseful(payload: Payload): Payload {
 // ---------------------------------------------------------------------------
 
 /**
- * TODO(stage-4): delete exactly the doomed line ranges from stage 3.
+ * TODO(stage-4): EXECUTE the decision stage 3 already made — delete exactly the
+ * line ranges in `payload.aggregation.doomedRanges`. This stage decides nothing;
+ * it carries out the keep/drop verdict.
  *
  * Removal is by LINE RANGE only. Because line numbers ride with the text, this
  * stage just drops the blocks/lines whose numbers fall in a doomed range; the
@@ -294,7 +418,7 @@ export function aggregateLeastUseful(payload: Payload): Payload {
  * line's "former" position.
  */
 export function removeLineRanges(payload: Payload): Payload {
-  // TODO(stage-4): remove doomed ranges; leave gaps in the line numbering.
+  // TODO(stage-4): drop the blocks/lines in payload.aggregation.doomedRanges.
   return payload;
 }
 
@@ -367,17 +491,18 @@ export function renderWithGapMarkers(payload: Payload): string {
  * (Payload) -> Payload stages with one terminal render. There is no other path,
  * by design.
  *
- * Status: engines 1-2 (SageRank + BMX+) are wired and each append a real
- * ranking to the payload; the mechanical/AST/render stages are documented
- * pass-through stubs, realized one at a time. The route runs end-to-end today
- * and returns the source unchanged (nothing is cut until aggregation + removal
- * are wired).
+ * Status: engines 1-2 (SageRank + BMX+) and the aggregation decision (stage 3)
+ * are wired — engines append rankings, aggregation computes the final per-block
+ * scores and names the least-useful ~30% as `doomedRanges`. Removal/flag/AST/
+ * render remain documented pass-through stubs, realized one at a time. The route
+ * runs end-to-end today and returns the source unchanged (nothing is cut until
+ * removal executes the decision).
  */
 export function compressSource(payload: Payload): string {
   let p = payload;
   p = rankByCentrality(p);       // engine 1 — SageRank (structural centrality)   [WIRED]
   p = rankByRelevance(p);        // engine 2 — BMX+ (lexical relevance)           [WIRED]
-  p = aggregateLeastUseful(p);   // mechanical: collective bottom-~30% line ranges [TODO]
+  p = aggregateLeastUseful(p);   // the keep/drop decision: least-useful ~30% lines [WIRED]
   p = removeLineRanges(p);       // mechanical: delete those ranges, leave gaps    [TODO]
   p = flagSmallBlocks(p);        // mechanical: mark blocks < 6 lines for stage 6  [TODO]
   p = restructureAST(p);         // engine: AST-aware restructure within budget    [TODO/kimi]

@@ -30,11 +30,18 @@
 // none of its "unique" pieces survive the pure-source / lines-only / no-fork /
 // no-marker / no-log rules. Nothing was recreated from it.
 //
-// Status: engines 1-2 (SageRank + BMX+) are wired; the mechanical/AST/render
-// stages are documented pass-through stubs, realized one at a time. The route
-// runs end-to-end today.
+// Status: engines 1-2 (SageRank + BMX+) + the aggregation decision (stage 3) are
+// wired; removal/flag/AST/render remain documented pass-through stubs, realized
+// one at a time. The route runs end-to-end today.
 export { compressSource } from './compress-source.js';
-export type { Payload, SourceBlock, EngineRanking } from './compress-source.js';
+export type {
+  Payload,
+  SourceBlock,
+  EngineRanking,
+  LineRange,
+  Aggregation,
+  EnginePairCorrelation,
+} from './compress-source.js';
 
 // ---------------------------------------------------------------------------
 // Ranking engines — two distinct, complementary intelligences:
