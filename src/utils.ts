@@ -1,93 +1,18 @@
-import { createHash } from 'node:crypto';
+// utils.ts — math + serialization helpers for the source compression route.
+//
+// Pure, engine-agnostic. Nothing here scores, decides, or routes; these are the
+// mechanical primitives the engines and the (forthcoming) aggregation stage call.
+// The log/tool-output heritage that used to live here (value NORMALIZERS, regex
+// singletons, normalizeValue, blake2bHash, flattenToText) has been removed — it
+// belonged to the deleted log codecs, not to source compression.
 
 // ---------------------------------------------------------------------------
-// Regex constants for value normalization
-// ---------------------------------------------------------------------------
-
-export const TIMESTAMP_RE: RegExp =
-  /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g;
-
-export const UUID_RE: RegExp =
-  /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
-
-export const IP_RE: RegExp = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
-
-export const BIGNUM_RE: RegExp = /\b\d{10,}\b/g;
-
-export const B64_RE: RegExp = /\b[A-Za-z0-9+/]{20,}={0,2}\b/g;
-
-// NOTE: JS regex with /g flag is STATEFUL — each regex in NORMALIZERS is a factory function to produce a fresh instance per call, avoiding lastIndex contamination across calls.
-export const NORMALIZERS: ReadonlyArray<readonly [() => RegExp, string]> = [
-  [(): RegExp => /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g, '<TS>'],
-  [(): RegExp => /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<UUID>'],
-  [(): RegExp => /\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '<IP>'],
-  [(): RegExp => /\b\d{10,}\b/g, '<NUM>'],
-  [(): RegExp => /\b[A-Za-z0-9+/]{20,}={0,2}\b/g, '<B64>'],
-];
-
-// ---------------------------------------------------------------------------
-// normalizeValue
+// canonicalJson — deterministic serialization (used by estimateTokensObj)
 // ---------------------------------------------------------------------------
 
 /**
- * Recursively normalize variable fields in a JSON-like structure.
- *.
- */
-export function normalizeValue(v: unknown): unknown {
-  if (typeof v === 'string') {
-    let s = v;
-    for (const [reFn, token] of NORMALIZERS) {
-      // Fresh regex instance per call to avoid /g lastIndex contamination.
-      s = s.replace(reFn(), token);
-    }
-    return s;
-  }
-  if (typeof v === 'number') {
-    return '<NUM>';
-  }
-  if (Array.isArray(v)) {
-    return v.map((item) => normalizeValue(item));
-  }
-  if (v !== null && typeof v === 'object') {
-    const obj = v as Record<string, unknown>;
-    const sorted = Object.keys(obj).sort();
-    const result: Record<string, unknown> = {};
-    for (const k of sorted) {
-      result[k] = normalizeValue(obj[k]);
-    }
-    return result;
-  }
-  // None / bool / other pass-through
-  return v;
-}
-
-// ---------------------------------------------------------------------------
-// blake2bHash
-// ---------------------------------------------------------------------------
-
-/**
- * Fast hash for dedup. Returns hex string.
- *
- * Uses blake2b512 full hash then slices to digestSize*2 hex characters.
- * This differs from a native variable-digest-size API but all comparisons
- * are internal (same process), so collision resistance is preserved.
- * All comparisons are TS↔TS within the same process.
- */
-export function blake2bHash(data: string, digestSize: number = 8): string {
-  return createHash('blake2b512')
-    .update(Buffer.from(data, 'utf-8'))
-    .digest('hex')
-    .slice(0, digestSize * 2);
-}
-
-// ---------------------------------------------------------------------------
-// canonicalJson
-// ---------------------------------------------------------------------------
-
-/**
- * Deterministic JSON serialization for hashing.
- * Sorts keys recursively at every nesting level, for deterministic output.
- * json.dumps(obj, sort_keys=True, separators=(',', ':'), default=str).
+ * Recursively sort object keys at every nesting level so serialization is
+ * deterministic regardless of insertion order.
  */
 function sortKeysDeep(v: unknown): unknown {
   if (Array.isArray(v)) {
@@ -105,9 +30,8 @@ function sortKeysDeep(v: unknown): unknown {
   return v;
 }
 
+/** Deterministic JSON serialization (sorted keys; non-serializable -> String()). */
 export function canonicalJson(obj: unknown): string {
-  // Non-serializable objects are converted via String().
-  // We replicate this with a replacer that converts unknown values to strings.
   const sorted = sortKeysDeep(obj);
   return JSON.stringify(sorted, (_key: string, value: unknown): unknown => {
     if (
@@ -142,34 +66,6 @@ export function estimateTokens(text: string): number {
 /** Estimate tokens for an arbitrary value via canonical JSON. */
 export function estimateTokensObj(obj: unknown): number {
   return estimateTokens(canonicalJson(obj));
-}
-
-// ---------------------------------------------------------------------------
-// flattenToText
-// ---------------------------------------------------------------------------
-
-/**
- * Convert any object to a flat text string for BMX+ indexing.
- */
-export function flattenToText(obj: unknown): string {
-  if (typeof obj === 'string') {
-    return obj;
-  }
-  if (Array.isArray(obj)) {
-    return obj.map((item) => flattenToText(item)).join(' ');
-  }
-  if (obj !== null && typeof obj === 'object') {
-    const entries = Object.entries(obj as Record<string, unknown>);
-    const parts: string[] = [];
-    for (const [k, v] of entries) {
-      parts.push(`${k} ${flattenToText(v)}`);
-    }
-    return parts.join(' ');
-  }
-  if (obj === null) {
-    return '';
-  }
-  return String(obj);
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +108,7 @@ export function computeGini(values: number[]): number {
  * Find knee point in a sorted-descending score curve.
  *
  * Returns index of the knee (boundary between core and periphery).
- * Implements Satopää et al. 2011 (IEEE ICDCS) simplified for 1D sorted 
+ * Implements Satopää et al. 2011 (IEEE ICDCS) simplified for 1D sorted
  * data.
  */
 export function findKneedle(scores: number[], sensitivity: number = 1.0): number {
@@ -288,7 +184,8 @@ export function findKneedle(scores: number[], sensitivity: number = 1.0): number
  * Pearson correlation coefficient between two equal-length lists.
  *
  * Returns 0.0 for degenerate inputs (n < 3 or zero variance).
- * Used in the pipeline to detect Phase 2/4 redundancy.
+ * Used to detect redundancy between two engines' score curves (if two distinct
+ * intelligences correlate too tightly, their agreement carries less signal).
  */
 export function pearsonR(x: number[], y: number[]): number {
   const n = x.length;
