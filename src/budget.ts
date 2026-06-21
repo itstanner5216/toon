@@ -1,5 +1,14 @@
 import { estimateTokensObj } from './utils.js';
-import { EntryMeta } from './types.js';
+
+/**
+ * Minimal shape the allocator needs: each entry exposes only its `content`
+ * so its token cost can be estimated. Deliberately decoupled from the
+ * (removed) dedup-era EntryMeta — this engine carries no log/dedup-pipeline
+ * dependency.
+ */
+interface ContentHolder {
+  content: unknown;
+}
 
 // ---------------------------------------------------------------------------
 // BudgetAllocation
@@ -47,7 +56,7 @@ export class BudgetAllocator {
    * @returns BudgetAllocation with per-entry budgets.
    */
   static allocate(
-    entries: EntryMeta[],
+    entries: ContentHolder[],
     scores: number[],
     tiers: string[],
     total_budget: number
