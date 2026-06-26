@@ -214,6 +214,11 @@ def compress(
     """
     cfg = config or CompressConfig()
 
+    # Fast path: single string → use source code compression directly.
+    if isinstance(data, str) and budget is not None:
+        from .string_codec import compress_string
+        return compress_string(data, budget, cfg.stack_trace_max_user_frames, query=query)
+
     # Normalize input to list
     is_single = not isinstance(data, list)
     entries = [data] if is_single else data

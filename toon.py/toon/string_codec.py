@@ -586,6 +586,129 @@ def _strip_sig(line: str, is_python: bool) -> str:
         return stripped
 
 
+def _dedup_priority(anchor_groups: list[dict], lines: list[str]) -> None:
+    """Reduce priority of functions whose body content is lexically redundant.
+
+    Builds a BMX+ index over all function bodies, then for each body searches
+    BMX+ to find similar neighbors. Functions with many high-similarity
+    neighbors have their content already represented elsewhere in the file —
+    they're safe to starve. Unique functions keep full priority.
+
+    Dedup multiplier: 1..0 range based on neighbor count (0 = unique, ~1 = redundant).
+    Applied as: priority *= (1.0 - dedup_ratio * 0.5) so max penalty is 50%.
+    """
+    from engines.bmx_plus import BMXPlusIndex
+
+    # Build body texts
+    body_texts: dict[str, str] = {}
+    for g in anchor_groups:
+        body = " ".join(lines[li].strip() for li in g["body_lines"])
+        if body:
+            body_texts[g["name"]] = body
+
+    if len(body_texts) < 3:
+        return
+
+    # Single BMX+ index over all function bodies
+    index = BMXPlusIndex()
+    chunks = [{"chunk_id": name, "text": text}
+              for name, text in body_texts.items()]
+    index.build_index(chunks)
+
+    # For each function body, search BMX+ with that body as query.
+    # The top result will be itself (score ~1.0). Count how many OTHER
+    # functions score above the similarity threshold — those are near-dupes.
+    similarity_threshold = 0.3
+    max_neighbors = 0
+    neighbor_counts: dict[str, int] = {}
+
+    for name, text in body_texts.items():
+        results = index.search(text, top_k=min(len(body_texts), 15))
+        # Skip self-match (first result, highest score)
+        neighbors = sum(
+            1 for rid, score in results[1:] if score >= similarity_threshold
+        ) if len(results) > 1 else 0
+        neighbor_counts[name] = neighbors
+        if neighbors > max_neighbors:
+            max_neighbors = neighbors
+
+    if max_neighbors == 0:
+        return
+
+    for g in anchor_groups:
+        name = g["name"]
+        neighbors = neighbor_counts.get(name, 0)
+        if neighbors > 0:
+            # dedup_ratio: 0..1, higher = more redundant
+            dedup_ratio = neighbors / max_neighbors
+            # Penalty: 0% (unique) to 50% (highly redundant)
+            g["priority"] *= (1.0 - dedup_ratio * 0.5)
+
+
+def _centrality_priority(anchor_groups: list[dict], lines: list[str]) -> None:
+    """Boost priority of functions central to the file's domain.
+
+    Builds a file-level pseudo-query from all function names and docstrings,
+    then searches BMX+ to find which function bodies are most lexically
+    similar to the file's overall vocabulary. Central functions get up to 3x
+    priority boost; peripheral utilities get no boost.
+    """
+    from engines.bmx_plus import BMXPlusIndex
+
+    body_texts: dict[str, str] = {}
+    for g in anchor_groups:
+        body = " ".join(lines[li].strip() for li in g["body_lines"])
+        if body:
+            body_texts[g["name"]] = body
+
+    if len(body_texts) < 3:
+        return
+
+    # Build BMX+ index over all function bodies
+    index = BMXPlusIndex()
+    chunks = [{"chunk_id": name, "text": text}
+              for name, text in body_texts.items()]
+    index.build_index(chunks)
+
+    # File-level pseudo-query: all function names, split into tokens
+    # This captures the file's domain vocabulary (e.g., "benchmark bm25 bmx
+    # evaluate index dataset download chunk validate compute metrics")
+    import re as _re
+    file_terms: list[str] = []
+    seen: set[str] = set()
+    for g in anchor_groups:
+        name = g["name"]
+        if name.startswith("_"):
+            name = name.lstrip("_")
+        for token in _re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)", name):
+            t = token.lower()
+            if len(t) >= 3 and t not in seen:
+                seen.add(t)
+                file_terms.append(t)
+    pseudo_query = " ".join(file_terms) if file_terms else None
+    if not pseudo_query:
+        return
+
+    # Search: which functions match the file's domain vocabulary?
+    results = index.search(pseudo_query, top_k=len(chunks))
+    if not results:
+        return
+
+    max_score = max(score for _, score in results)
+    if max_score <= 0:
+        return
+
+    # Boost central functions, penalize peripheral ones
+    for cid, score in results:
+        for g in anchor_groups:
+            if g["name"] == cid:
+                # Centrality ratio: 0..1, higher = more central
+                centrality = score / max_score
+                # Boost: 1.0 (peripheral) to 3.0 (central)
+                g["priority"] *= 1.0 + centrality * 2.0
+                break
+
+
 def _apply_query_relevance(
     query: str,
     anchor_groups: list[dict],
@@ -598,7 +721,6 @@ def _apply_query_relevance(
     query relevance). Groups with zero relevance keep their original priority.
     """
     query_lower = query.lower()
-    # Tokenize into words, keep only alpha tokens >= 3 chars
     query_tokens = [
         t for t in re.findall(r"\w+", query_lower) if len(t) >= 3
     ]
@@ -615,17 +737,10 @@ def _apply_query_relevance(
         if not body_text:
             continue
 
-        # TF overlap: how many query tokens appear in the body
         hits = sum(1 for t in query_tokens if t in body_text)
         query_score = hits / len(query_tokens) if query_tokens else 0.0
-
-        # Scale query_score to similar range as name priority (100-300)
-        # query_score is 0..1, scale to 1..300
         scaled_query = 1.0 + query_score * 299.0
-
-        # Blend with name priority
-        name_prio = group["priority"]
-        blended = name_prio * name_weight + scaled_query * query_weight
+        blended = group["priority"] * name_weight + scaled_query * query_weight
         group["priority"] = blended
 
 
@@ -683,280 +798,234 @@ def _is_source_code(text: str) -> bool:
     return score >= 5
 
 
-def _compress_source_code(text: str, budget: int, query: str | None = None) -> str:
-    """Structure-aware source code compression.
+def _compress_source_code(text: str, budget: int, query: str | None = None, _depth: int = 0) -> str:
+    """Compress source code via the engine chain: Entry → SageRank → BMX+ → Removal.
 
-    Priority order:
-      1. Module-level docstring — capped to 5 lines max.
-      2. Always keep: imports, top-level constants, decorator lines,
-         def/class signature lines, first docstring line per function.
-      3. Remaining budget → function bodies ranked by priority:
-         If query is provided: blend name priority (30%) + query relevance (70%).
-         Otherwise: entry-point names (300) > public functions (200) > private helpers (100).
-         Bodies truncated from the inside with clean '# ... [N lines omitted]' markers.
+    Architecture:
+      1. Entry: each line weighed by its share of total file content
+      2. SageRank: each block scored by PageRank graph centrality
+      3. BMX+: each line scored by lexical relevance to a structural query
+         built from symbol names (function/class definitions)
+      4. Combined: entry × sage_block × bmx_line per line
+      5. Removal: lowest-scored lines removed via binary search until budget fits
+      6. Render: original order with gap markers
+
+    No function-body priority heuristics. No atomic keep/drop blocks.
+    Every line competes on its combined score.
     """
+    if len(text) <= budget:
+        return text
+
+    if _depth > 0:
+        return _content_aware_truncate(text, budget)
+
+    from engines.bmx_plus import BMXPlusIndex
+    from engines.sagerank import SageRank
+
     lines = text.split("\n")
     n = len(lines)
+    total_chars = sum(len(l) for l in lines)
 
-    # Find and cap module-level docstring
-    i = 0
-    while i < n and not lines[i].strip():
-        i += 1
-
-    mod_doc_indices: list[int] = []
-    MOD_DOC_CAP = 5
-    if i < n:
-        s = lines[i].strip()
-        if s.startswith(('"""', "'''")):
-            marker = s[:3]
-            mod_doc_indices.append(i)
-            if not (s.count(marker) >= 2 and len(s) > 3):  # multi-line
-                j = i + 1
-                while j < n:
-                    mod_doc_indices.append(j)
-                    if lines[j].strip().endswith(marker) and j > i:
-                        break
-                    j += 1
-
-    mod_doc_set = set(mod_doc_indices)
-    mod_doc_keep = mod_doc_indices[:MOD_DOC_CAP]
-    mod_doc_omitted = len(mod_doc_indices) - len(mod_doc_keep)
-
-    # Parse lines into anchor groups
-    # Each def/class/function starts an anchor_group. Lines between groups
-    # (imports, constants, logger setup) are always included.
-    always_lines: list[int] = []  # top-level code (NOT imports)
-    import_lines: list[int] = []  # import lines (collapsed to summary)
-    import_packages: set[str] = set()  # unique top-level packages
-    anchor_groups: list[dict] = []
-    pending_decorators: list[int] = []
-    current_group: dict | None = None
+    # ── Phase 0: Parse blocks ──────────────────────────────────────
+    # Split source into logical blocks for SageRank (block-level)
+    blocks: list[dict] = []
+    block_idx = 0
+    cur_start = 0
+    cur_kind = "top"
+    cur_name = ""
+    pending_decs: list[int] = []
+    in_imports = False
 
     for i, line in enumerate(lines):
-        if i in mod_doc_set:
-            continue
-        stripped = line.strip()
-
-        if not stripped:
-            if current_group is not None:
-                current_group["body_lines"].append(i)
-            continue
-
+        s = line.strip()
         if _SOURCE_IMPORT_RE.match(line):
-            import_lines.append(i)
-            # Extract top-level package for summary
-            stripped_lower = stripped.lower()
-            # Extract package: "from X import Y" -> X.split('.')[0]
-            # or "import X" -> X.split('.')[0]
-            if stripped_lower.startswith("from "):
-                pkg = stripped.split()[1].split(".")[0]
-                import_packages.add(pkg)
-            elif stripped_lower.startswith("import "):
-                pkg = stripped.split()[1].split(".")[0].rstrip(",")
-                import_packages.add(pkg)
-            current_group = None
-            pending_decorators = []
+            if not in_imports and cur_start < i:
+                blocks.append({"start": cur_start, "end": i, "kind": cur_kind,
+                               "name": cur_name, "idx": block_idx})
+                block_idx += 1
+            if not in_imports:
+                cur_start = i; cur_kind = "import"; cur_name = "imports"
+                in_imports = True
             continue
-
-        # Multi-line import continuation (indented names/commas inside import block)
-        if import_lines and not current_group:
-            line_indent = len(line) - len(line.lstrip())
-            if line_indent > 0 and stripped:
-                # Import continuations are indented name lists with commas
-                first = stripped.split()[0].rstrip(',')
-                looks_like_continuation = (
-                    first
-                    and first.replace('.', '').replace('_', '').isalnum()
-                    and (',' in stripped or stripped == ')')
-                )
-                if looks_like_continuation:
-                    import_lines.append(i)
+        if in_imports:
+            indent = len(line) - len(line.lstrip())
+            if indent > 0 and s:
+                first = s.split()[0].rstrip(',')
+                if first and first.replace('.', '').replace('_', '').isalnum():
                     continue
-            # Closing paren on its own line after import block
-            if re.match(r'^\s*\)\s*$', stripped):
-                import_lines.append(i)
+            if s == ')':
                 continue
-
+            blocks.append({"start": cur_start, "end": i, "kind": cur_kind,
+                           "name": cur_name, "idx": block_idx})
+            block_idx += 1
+            in_imports = False
+            cur_start = i; cur_kind = "top"; cur_name = ""
         if _DECORATOR_RE.match(line):
-            pending_decorators.append(i)
+            pending_decs.append(i)
             continue
-
-        m = _DEF_RE.match(stripped)
+        m = _DEF_RE.match(s)
         if m:
             name = next((g for g in m.groups() if g), "")
-            indent = len(line) - len(line.lstrip())
-            is_dunder = name in _DUNDER_KEEPERS
-            is_private = name.startswith("_") and not is_dunder
-            is_entry = name.lower() in _ENTRY_POINT_NAMES
-            priority = (
-                300 if is_entry else 200 if not is_private else 100) - indent * 0.5
+            start = pending_decs[0] if pending_decs else i
+            if cur_start < start:
+                blocks.append({"start": cur_start, "end": start, "kind": cur_kind,
+                               "name": cur_name, "idx": block_idx})
+                block_idx += 1
+            cur_start = start; cur_kind = "def"; cur_name = name
+            pending_decs = []
 
-            current_group = {
-                "sig_line": i,
-                "decorator_lines": list(pending_decorators),
-                "name": name,
-                "priority": priority,
-                "body_lines": [],
-            }
-            anchor_groups.append(current_group)
-            pending_decorators = []
-            continue
+    if cur_start < n:
+        blocks.append({"start": cur_start, "end": n, "kind": cur_kind,
+                       "name": cur_name, "idx": block_idx})
+        block_idx += 1
 
-        if current_group is not None:
-            current_group["body_lines"].append(i)
-        else:
-            # Top-level code outside any def (constants, logger = ..., etc.)
-            if pending_decorators:
-                always_lines.extend(pending_decorators)
-                pending_decorators = []
-            always_lines.append(i)
+    # Build entries and line-to-block mapping
+    entries = []
+    line_block: dict[int, int] = {}  # line_index → entry_index
+    for b in blocks:
+        txt = "\n".join(lines[b["start"]:b["end"]]).rstrip("\n")
+        if txt.strip():
+            ei = len(entries)
+            entries.append({"content": txt, "index": b["idx"],
+                            "kind": b["kind"], "name": b["name"],
+                            "start": b["start"], "end": b["end"]})
+            for ln in range(b["start"], b["end"]):
+                line_block[ln] = ei
 
-    # Query-guided relevance scoring for body priority
-    # Auto-query: if no explicit query provided, derive from symbol names
-    effective_query = query or _auto_query_from_symbols(anchor_groups)
-    if effective_query and anchor_groups:
-        _apply_query_relevance(effective_query, anchor_groups, lines)
+    if not entries:
+        return text[:budget]
 
-    # Build mandatory set (signatures + top-level code, NOT raw imports)
-    mandatory: set[int] = set(mod_doc_keep)
-    mandatory.update(always_lines)
-    for g in anchor_groups:
-        mandatory.add(g["sig_line"])
-        mandatory.update(g["decorator_lines"])
-        # First non-blank body line if it looks like a docstring
-        for li in g["body_lines"]:
-            if not lines[li].strip():
-                continue
-            if lines[li].strip().startswith(('"""', "'''", "//", "/*", "*")):
-                mandatory.add(li)
-            break  # only check the very first non-blank body line
+    # ── Phase 1: Entry weights ─────────────────────────────────────
+    # Every line weighed by its share of total file content (char ratio)
+    entry_weight: list[float] = [0.0] * n
+    if total_chars > 0:
+        for i in range(n):
+            entry_weight[i] = len(lines[i]) / total_chars
 
-    def lc(idx: int) -> int:
-        return len(lines[idx]) + 1
+    # ── Phase 2: SageRank block scores ─────────────────────────────
+    sage = SageRank()
+    block_texts = [e["content"] for e in entries]
+    sage_result = sage.rank_sentences(block_texts, top_k=len(entries), query=query)
+    sage_scores = sage_result.scores
 
-    mandatory_chars = sum(lc(i) for i in mandatory)
-    if mod_doc_omitted:
-        mandatory_chars += 50
-    # Compact import summary instead of raw import lines
-    import_summary = ""
-    if import_packages:
-        pkg_list = ", ".join(sorted(import_packages))
-        import_summary = f"# imports: {pkg_list}\n"
-        mandatory_chars += len(import_summary)
-    remaining = max(0, budget - mandatory_chars)
+    # Normalize SageRank scores to [0,1]
+    smax = max(sage_scores) if sage_scores else 1.0
+    sage_norm = [s / smax if smax > 0 else 0.5 for s in sage_scores]
 
-    # Fill bodies by proportional priority allocation.
-    # First pass: every function gets fair-share budget (weighted by priority).
-    # Guaranteed min 1 body line prevents early-file starvation.
-    # Second pass: leftover budget distributed by priority.
-    included_body: set[int] = set()
-    MARKER_COST = 45  # approx cost of a '# ... [NNNN lines omitted]\n' marker
+    # ── Phase 3: BMX+ line scores ──────────────────────────────────
+    # Build structural query from symbol names
+    symbol_names: list[str] = []
+    for e in entries:
+        name = e["name"]
+        if name and name not in ("", "imports", "top"):
+            symbol_names.append(name)
 
-    viable = [(g, [li for li in g["body_lines"] if li not in mandatory])
-              for g in anchor_groups]
-    viable = [(g, body) for g, body in viable if body]
+    # Build BMX+ query: symbol names (whole + split) + corpus terms
+    query_parts: list[str] = []
+    if query:
+        query_parts.append(query)
+    for name in symbol_names:
+        query_parts.append(name.lower())
+        # Split camelCase/Snake_case
+        import re as _re
+        tokens = _re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)|[a-z]+", name)
+        if len(tokens) > 1:
+            query_parts.extend(t.lower() for t in tokens if len(t) >= 2)
+    bmx_query = " ".join(query_parts) if query_parts else ""
 
-    if viable and remaining > 0:
-        total_priority = sum(max(g["priority"], 1) for g, _ in viable)
-
-        # First pass: proportional allocation
-        for group, body in viable:
-            share = max(1, int(remaining * max(group["priority"], 1) / total_priority))
-            used = 0
-            gave_one = False
-            for li in body:
-                cost = lc(li)
-                if used + cost > share and gave_one:
-                    break
-                included_body.add(li)
-                used += cost
-                gave_one = True
-            remaining -= used
-
-        # Second pass: greedy allocation of leftover by priority
-        if remaining > MARKER_COST:
-            for group, body in sorted(
-                    viable, key=lambda x: x[0]["priority"], reverse=True):
-                if remaining <= MARKER_COST:
-                    break
-                rest = [li for li in body if li not in included_body]
-                if not rest:
-                    continue
-                rest_chars = sum(lc(li) for li in rest)
-                if rest_chars <= remaining:
-                    included_body.update(rest)
-                    remaining -= rest_chars
-                else:
-                    used = 0
-                    for li in rest:
-                        cost = lc(li)
-                        if used + cost + MARKER_COST > remaining:
-                            break
-                        included_body.add(li)
-                        used += cost
-                    if used == 0:
-                        remaining = 0  # no room left, stop trying
-                    else:
-                        remaining -= used
-
-    # Reconstruct in original line order
-    all_included = mandatory | included_body
-    result: list[str] = []
-
-    # Module docstring block
-    for i in mod_doc_keep:
-        result.append(lines[i])
-    if mod_doc_omitted:
-        result.append(f"# ... [{mod_doc_omitted} docstring lines omitted]")
-
-    # Scan remaining lines in order, inserting omission markers at cut points.
-    # Reconstruct with: import summary → stripped signatures → body content.
-    pending_blanks: list[str] = []
-    omit_count = 0
-    omit_indent = "    "
-
-    # Emit compact import summary at top (before any other lines)
-    if import_summary:
-        result.append(import_summary.rstrip("\n"))
-
-    # Build set of sig lines for annotation stripping
-    sig_set = {g["sig_line"] for g in anchor_groups}
-    is_python = any(
-        lines[i].strip().startswith(("def ", "class "))
-        for i in sig_set if i < n)
-
+    # Index every non-blank line
+    line_chunks: list[dict] = []
+    line_indices: list[int] = []  # parallel: which absolute line index
     for i, line in enumerate(lines):
-        if i in mod_doc_set:
-            continue
+        content = line.strip()
+        if content:
+            line_chunks.append({"chunk_id": str(i), "text": content})
+            line_indices.append(i)
 
-        # Skip raw import lines (replaced by summary)
-        if i in import_lines:
-            pending_blanks = []
-            continue
+    bmx_scores: list[float] = [0.0] * n
+    if line_chunks and bmx_query:
+        bmx = BMXPlusIndex(normalize_scores=True)
+        bmx.build_index(line_chunks)
+        results = bmx.search(bmx_query, top_k=len(line_chunks))
+        for cid, score in results:
+            idx = int(cid)
+            if 0 <= idx < n:
+                bmx_scores[idx] = score
 
-        if not line.strip():
-            pending_blanks.append(line)
-            continue
+    # ── Phase 4: Combined score per line ───────────────────────────
+    # line_score = entry_weight[i] × sage_block_score × bmx_line_score
+    combined: list[float] = [0.0] * n
+    for i in range(n):
+        block_idx_i = line_block.get(i, -1)
+        sage_s = sage_norm[block_idx_i] if 0 <= block_idx_i < len(sage_norm) else 0.1
+        bmx_s = bmx_scores[i] if i < len(bmx_scores) else 0.0
+        # SageRank × BMX+: block centrality × line lexical relevance
+        combined[i] = sage_s * bmx_s
 
-        if i in all_included:
-            if omit_count > 0:
-                result.append(
-                    f"{omit_indent}# ... [{omit_count} lines omitted]")
-                omit_count = 0
-            result.extend(pending_blanks)
-            pending_blanks = []
-            # Strip type annotations from signature lines
-            emitted = _strip_sig(line, is_python) if i in sig_set else line
-            result.append(emitted)
-            omit_indent = " " * (len(emitted) - len(emitted.lstrip()) + 4)
+    # ── Phase 5: Chunk scoring and threshold-based selection ─────────
+    # Slice into uniform 15-line chunks. Score each chunk by average
+    # combined line score. Keep chunks above threshold; drop below.
+    # Binary search threshold to meet budget.
+
+    CHUNK_SIZE = 15
+    chunks: list[dict] = []
+    for start in range(0, n, CHUNK_SIZE):
+        end = min(start + CHUNK_SIZE, n)
+        chunk_scores = combined[start:end]
+        avg = sum(chunk_scores) / len(chunk_scores) if chunk_scores else 0.0
+        content = "\n".join(lines[start:end])
+        chunks.append({"start": start, "end": end, "avg_score": avg, "content": content})
+
+    if not chunks:
+        return text[:budget]
+
+    all_scores = sorted(c["avg_score"] for c in chunks)
+
+    def _reconstruct(threshold: float) -> tuple[str, int]:
+        result_lines: list[str] = []
+        gap = 0
+        for c in chunks:
+            if c["avg_score"] >= threshold:
+                if gap >= _MIN_OMISSION_THRESHOLD:
+                    result_lines.append(f"# ... [{gap} lines omitted]")
+                elif gap > 0:
+                    for j in range(c["start"] - gap, c["start"]):
+                        result_lines.append(lines[j])
+                gap = 0
+                result_lines.append(c["content"])
+            else:
+                gap += (c["end"] - c["start"])
+        if gap >= _MIN_OMISSION_THRESHOLD:
+            result_lines.append(f"# ... [{gap} lines omitted]")
+        elif gap > 0:
+            for j in range(n - gap, n):
+                result_lines.append(lines[j])
+        result = "\n".join(result_lines)
+        return result, len(result)
+
+    # Binary search threshold in sorted scores
+    lo, hi = 0, len(all_scores)
+    best_result = text[:budget]
+    while lo < hi:
+        mid = (lo + hi) // 2
+        threshold = all_scores[mid]
+        _, size = _reconstruct(threshold)
+        if size <= budget:
+            best_result, _ = _reconstruct(threshold)
+            hi = mid
         else:
-            pending_blanks = []  # discard blanks belonging to omitted section
-            omit_count += 1
+            lo = mid + 1
 
-    if omit_count > 0:
-        result.append(f"{omit_indent}# ... [{omit_count} lines omitted]")
+    if lo >= len(all_scores):
+        final, final_size = _reconstruct(all_scores[-1] + 0.001)
+        if final_size > budget:
+            return text[:budget]
+        return final
 
-    return "\n".join(result)
+    result = best_result
+    if len(result) > budget:
+        result = result[:budget]
+    return result
 
 
 #  Structured Source Compression (tree-sitter metadata path)
