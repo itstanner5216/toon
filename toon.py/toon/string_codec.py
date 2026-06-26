@@ -761,10 +761,17 @@ def _compress_source_code(text: str, budget: int, query: str | None = None) -> s
         # Multi-line import continuation (indented names/commas inside import block)
         if import_lines and not current_group:
             line_indent = len(line) - len(line.lstrip())
-            if line_indent > 0 and re.match(
-                    r'^\s+(?:[\w.]+\s*,?\s*)+$', line):
-                import_lines.append(i)
-                continue
+            if line_indent > 0 and stripped:
+                # Import continuations are indented name lists with commas
+                first = stripped.split()[0].rstrip(',')
+                looks_like_continuation = (
+                    first
+                    and first.replace('.', '').replace('_', '').isalnum()
+                    and (',' in stripped or stripped == ')')
+                )
+                if looks_like_continuation:
+                    import_lines.append(i)
+                    continue
             # Closing paren on its own line after import block
             if re.match(r'^\s*\)\s*$', stripped):
                 import_lines.append(i)
@@ -838,35 +845,59 @@ def _compress_source_code(text: str, budget: int, query: str | None = None) -> s
         mandatory_chars += len(import_summary)
     remaining = max(0, budget - mandatory_chars)
 
-    # Fill bodies by priority
+    # Fill bodies by proportional priority allocation.
+    # First pass: every function gets fair-share budget (weighted by priority).
+    # Guaranteed min 1 body line prevents early-file starvation.
+    # Second pass: leftover budget distributed by priority.
     included_body: set[int] = set()
     MARKER_COST = 45  # approx cost of a '# ... [NNNN lines omitted]\n' marker
 
-    for group in sorted(
-            anchor_groups,
-            key=lambda g: g["priority"],
-            reverse=True):
-        if remaining <= 0:
-            break
-        body = [li for li in group["body_lines"] if li not in mandatory]
-        if not body:
-            continue
+    viable = [(g, [li for li in g["body_lines"] if li not in mandatory])
+              for g in anchor_groups]
+    viable = [(g, body) for g, body in viable if body]
 
-        body_chars = sum(lc(li) for li in body)
-        if body_chars <= remaining:
-            included_body.update(body)
-            remaining -= body_chars
-        else:
-            # Fit lines from the top of the body, leave room for omission
-            # marker
+    if viable and remaining > 0:
+        total_priority = sum(max(g["priority"], 1) for g, _ in viable)
+
+        # First pass: proportional allocation
+        for group, body in viable:
+            share = max(1, int(remaining * max(group["priority"], 1) / total_priority))
             used = 0
+            gave_one = False
             for li in body:
                 cost = lc(li)
-                if used + cost + MARKER_COST > remaining:
+                if used + cost > share and gave_one:
                     break
                 included_body.add(li)
                 used += cost
+                gave_one = True
             remaining -= used
+
+        # Second pass: greedy allocation of leftover by priority
+        if remaining > MARKER_COST:
+            for group, body in sorted(
+                    viable, key=lambda x: x[0]["priority"], reverse=True):
+                if remaining <= MARKER_COST:
+                    break
+                rest = [li for li in body if li not in included_body]
+                if not rest:
+                    continue
+                rest_chars = sum(lc(li) for li in rest)
+                if rest_chars <= remaining:
+                    included_body.update(rest)
+                    remaining -= rest_chars
+                else:
+                    used = 0
+                    for li in rest:
+                        cost = lc(li)
+                        if used + cost + MARKER_COST > remaining:
+                            break
+                        included_body.add(li)
+                        used += cost
+                    if used == 0:
+                        remaining = 0  # no room left, stop trying
+                    else:
+                        remaining -= used
 
     # Reconstruct in original line order
     all_included = mandatory | included_body

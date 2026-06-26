@@ -11,7 +11,7 @@ import os
 import subprocess
 import sys
 
-from toon.string_codec import compress_string
+from string_codec import compress_string
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

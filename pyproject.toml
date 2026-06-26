@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "toon-plus"
+version = "2.0.0"
+description = "Intelligent LLM context compression — entropy-weighted scoring meets structural encoding"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Tanner", email = "your@email.com" },
+]
+keywords = [
+    "llm",
+    "compression",
+    "context-window",
+    "tool-output",
+    "mcp",
+    "bm25",
+    "textrank",
+    "information-retrieval",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Indexing",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "rouge-score>=0.1.2",
+]
+
+[project.urls]
+Repository = "https://github.com/itstanner5216/toon"
+Documentation = "https://github.com/itstanner5216/toon/blob/main/ARCHITECTURE.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["toon", "engines"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 95
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
