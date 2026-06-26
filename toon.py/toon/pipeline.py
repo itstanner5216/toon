@@ -183,7 +183,7 @@ class TOONCompressor:
         if not result.entries:
             return None
         content = result.entries[0]["content"]
-        return _compress_entry(content, budget=None, config=self.config)
+        return _compress_entry(content, budget=None, config=self.config, query=None)
 
     def reset(self):
         """Reset dedup state (session boundary)."""
@@ -240,7 +240,7 @@ def compress(
     allocation = BudgetAllocator.allocate(
         scored.entries, scored.scores, scored.tiers, budget)
 
-    compressed = _compress_entries(scored, allocation, cfg)
+    compressed = _compress_entries(scored, allocation, cfg, query=query)
 
     if is_single and compressed.entries:
         return compressed.entries[0]
@@ -466,6 +466,7 @@ def _compress_entries(
     scored: ScoredEntries,
     allocation: BudgetAllocation,
     config: CompressConfig,
+    query: str | None = None,
 ) -> CompressedOutput:
     """Stage 3: Apply budget-aware compression to each entry."""
     compressed: list[Any] = []
@@ -485,7 +486,7 @@ def _compress_entries(
 
         content = entry["content"]
         result = _compress_entry(
-            content, entry_budget, config, entry_meta=entry)
+            content, entry_budget, config, entry_meta=entry, query=query)
         indexed_results.append((entry["index"], result))
         total_tokens += estimate_tokens_obj(result)
 
@@ -519,6 +520,7 @@ def _compress_entry(
     budget: int | None,
     config: CompressConfig,
     entry_meta: dict | None = None,
+    query: str | None = None,
 ) -> Any:
     """Compress a single entry using type-appropriate strategy.
 
@@ -534,11 +536,13 @@ def _compress_entry(
             "first": _compress_entry(
                 entry_meta["template_first"],
                 half,
-                config),
+                config,
+                query=query),
             "last": _compress_entry(
                 entry_meta["template_last"],
                 half,
-                config),
+                config,
+                query=query),
         }
 
     if isinstance(content, str):
@@ -556,10 +560,10 @@ def _compress_entry(
                     return content
 
         return compress_string(
-            content, budget, config.stack_trace_max_user_frames)
+            content, budget, config.stack_trace_max_user_frames, query=query)
 
     if isinstance(content, dict):
-        return _compress_dict(content, budget, config)
+        return _compress_dict(content, budget, config, query=query)
 
     if isinstance(content, (list, tuple)):
         threshold = max(3, budget // 50) if budget is not None else 5
@@ -571,7 +575,8 @@ def _compress_entry(
 def _compress_dict(
         obj: dict,
         budget: int | None,
-        config: CompressConfig) -> dict:
+        config: CompressConfig,
+        query: str | None = None) -> dict:
     """Compress a dict with field routing: preserve vs. encode."""
     result = {}
     for key, value in obj.items():
@@ -583,7 +588,8 @@ def _compress_dict(
             elif isinstance(value, str) and budget:
                 field_budget = budget // max(1, len(obj))
                 result[key] = compress_string(
-                    value, field_budget, config.stack_trace_max_user_frames
+                    value, field_budget, config.stack_trace_max_user_frames,
+                    query=query
                 )
             else:
                 result[key] = value

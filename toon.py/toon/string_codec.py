@@ -56,7 +56,12 @@ _USER_FRAME_EXCLUDES = re.compile(
 )
 
 
-def compress_string(text: str, budget: int, max_user_frames: int = 10) -> str:
+def compress_string(
+    text: str,
+    budget: int,
+    max_user_frames: int = 10,
+    query: str | None = None,
+) -> str:
     """Compress a string using content-type detection and type-specific strategies.
 
     Dispatches to the most appropriate compressor based on content analysis:
@@ -66,6 +71,7 @@ def compress_string(text: str, budget: int, max_user_frames: int = 10) -> str:
         text: Input string.
         budget: Maximum character budget for output.
         max_user_frames: Max user-code frames to retain in stack traces.
+        query: Optional relevance query to bias source compression toward.
 
     Returns:
         Compressed string within budget.
@@ -77,7 +83,7 @@ def compress_string(text: str, budget: int, max_user_frames: int = 10) -> str:
     # signals and prevent false-positive stack-trace or log detection on
     # source files.
     if _is_source_code(text):
-        return _compress_source_code(text, budget)
+        return _compress_source_code(text, budget, query=query)
 
     if _is_stack_trace(text):
         return _compress_stack_trace(text, budget, max_user_frames)
@@ -510,6 +516,49 @@ _DOC_TAG_RE = re.compile(
 _MIN_OMISSION_THRESHOLD = 3
 
 
+def _apply_query_relevance(
+    query: str,
+    anchor_groups: list[dict],
+    lines: list[str],
+) -> None:
+    """Blend query relevance into each anchor group's priority score.
+
+    For each function body, computes a simple TF-overlap score against the
+    query tokens and blends it with the name-based priority (30% name, 70%
+    query relevance). Groups with zero relevance keep their original priority.
+    """
+    query_lower = query.lower()
+    # Tokenize into words, keep only alpha tokens >= 3 chars
+    query_tokens = [
+        t for t in re.findall(r"\w+", query_lower) if len(t) >= 3
+    ]
+    if not query_tokens:
+        return
+
+    name_weight = 0.3
+    query_weight = 0.7
+
+    for group in anchor_groups:
+        body_text = " ".join(
+            lines[li].strip() for li in group["body_lines"]
+        ).lower()
+        if not body_text:
+            continue
+
+        # TF overlap: how many query tokens appear in the body
+        hits = sum(1 for t in query_tokens if t in body_text)
+        query_score = hits / len(query_tokens) if query_tokens else 0.0
+
+        # Scale query_score to similar range as name priority (100-300)
+        # query_score is 0..1, scale to 1..300
+        scaled_query = 1.0 + query_score * 299.0
+
+        # Blend with name priority
+        name_prio = group["priority"]
+        blended = name_prio * name_weight + scaled_query * query_weight
+        group["priority"] = blended
+
+
 def _is_comment_only_line(line: str) -> bool:
     stripped = line.strip()
     return not stripped or stripped.startswith(
@@ -564,7 +613,7 @@ def _is_source_code(text: str) -> bool:
     return score >= 5
 
 
-def _compress_source_code(text: str, budget: int) -> str:
+def _compress_source_code(text: str, budget: int, query: str | None = None) -> str:
     """Structure-aware source code compression.
 
     Priority order:
@@ -572,7 +621,8 @@ def _compress_source_code(text: str, budget: int) -> str:
       2. Always keep: imports, top-level constants, decorator lines,
          def/class signature lines, first docstring line per function.
       3. Remaining budget → function bodies ranked by priority:
-         entry-point names (300) > public functions (200) > private helpers (100).
+         If query is provided: blend name priority (30%) + query relevance (70%).
+         Otherwise: entry-point names (300) > public functions (200) > private helpers (100).
          Bodies truncated from the inside with clean '# ... [N lines omitted]' markers.
     """
     lines = text.split("\n")
@@ -659,6 +709,10 @@ def _compress_source_code(text: str, budget: int) -> str:
                 always_lines.extend(pending_decorators)
                 pending_decorators = []
             always_lines.append(i)
+
+    # Query-guided relevance scoring for body priority
+    if query and anchor_groups:
+        _apply_query_relevance(query, anchor_groups, lines)
 
     # Build mandatory set
     mandatory: set[int] = set(mod_doc_keep)
