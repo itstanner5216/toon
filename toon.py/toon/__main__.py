@@ -28,6 +28,12 @@ parser.add_argument(
     action="store_true",
     help="Structured mode: read {content, budget, structure} JSON from stdin",
 )
+parser.add_argument(
+    "--query",
+    type=str,
+    default=None,
+    help="Relevance query to bias source compression toward",
+)
 args = parser.parse_args()
 
 raw = sys.stdin.read()
@@ -48,7 +54,7 @@ if args.structured:
     if structure:
         result = compress_source_structured(content, budget, structure)
     else:
-        result = compress_string(content, budget)
+        result = compress_string(content, budget, query=args.query)
 
     sys.stdout.write(result)
 
@@ -59,7 +65,7 @@ else:
     except json.JSONDecodeError:
         data = raw
 
-    result = compress(data, budget=args.budget)
+    result = compress(data, budget=args.budget, query=args.query)
     if isinstance(result, str):
         sys.stdout.write(result)
     else:
