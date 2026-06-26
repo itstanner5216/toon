@@ -965,27 +965,65 @@ def _compress_source_code(text: str, budget: int, query: str | None = None, _dep
     # ── Phase 5: Chunk scoring and threshold-based selection ─────────
     # Slice into uniform 15-line chunks. Score each chunk by average
     # combined line score. Keep chunks above threshold; drop below.
-    # Binary search threshold to meet budget.
+    # Enforce MAX_GAP — if any omission gap exceeds 2 chunks, keep the
+    # highest-scored dropped chunk inside it to break the gap.
 
     CHUNK_SIZE = 15
+    MAX_GAP = 30  # max lines in any omission gap (2 chunks)
     chunks: list[dict] = []
     for start in range(0, n, CHUNK_SIZE):
         end = min(start + CHUNK_SIZE, n)
         chunk_scores = combined[start:end]
         avg = sum(chunk_scores) / len(chunk_scores) if chunk_scores else 0.0
         content = "\n".join(lines[start:end])
-        chunks.append({"start": start, "end": end, "avg_score": avg, "content": content})
+        chunks.append({"idx": len(chunks), "start": start, "end": end,
+                        "avg_score": avg, "content": content})
 
     if not chunks:
         return text[:budget]
 
     all_scores = sorted(c["avg_score"] for c in chunks)
 
-    def _reconstruct(threshold: float) -> tuple[str, int]:
+    def _build_kept(threshold: float) -> list[bool]:
+        """Threshold → kept mask, then force-break gaps > MAX_GAP."""
+        kept = [c["avg_score"] >= threshold for c in chunks]
+        changed = True
+        while changed:
+            changed = False
+            gap_start = -1
+            gap = 0
+            for i, c in enumerate(chunks):
+                if kept[i]:
+                    if gap > MAX_GAP:
+                        # Find highest-scored dropped chunk in this gap
+                        best_ci = max(
+                            (j for j in range(gap_start, i) if not kept[j]),
+                            key=lambda j: chunks[j]["avg_score"],
+                            default=-1)
+                        if best_ci >= 0:
+                            kept[best_ci] = True
+                            changed = True
+                    gap = 0
+                else:
+                    if gap == 0:
+                        gap_start = i
+                    gap += (c["end"] - c["start"])
+            # Check trailing gap
+            if gap > MAX_GAP:
+                best_ci = max(
+                    (j for j in range(gap_start, len(chunks)) if not kept[j]),
+                    key=lambda j: chunks[j]["avg_score"],
+                    default=-1)
+                if best_ci >= 0:
+                    kept[best_ci] = True
+                    changed = True
+        return kept
+
+    def _reconstruct_from_kept(kept: list[bool]) -> tuple[str, int]:
         result_lines: list[str] = []
         gap = 0
         for c in chunks:
-            if c["avg_score"] >= threshold:
+            if kept[c["idx"]]:
                 if gap >= _MIN_OMISSION_THRESHOLD:
                     result_lines.append(f"# ... [{gap} lines omitted]")
                 elif gap > 0:
@@ -1009,15 +1047,17 @@ def _compress_source_code(text: str, budget: int, query: str | None = None, _dep
     while lo < hi:
         mid = (lo + hi) // 2
         threshold = all_scores[mid]
-        _, size = _reconstruct(threshold)
+        kept = _build_kept(threshold)
+        _, size = _reconstruct_from_kept(kept)
         if size <= budget:
-            best_result, _ = _reconstruct(threshold)
+            best_result, _ = _reconstruct_from_kept(kept)
             hi = mid
         else:
             lo = mid + 1
 
     if lo >= len(all_scores):
-        final, final_size = _reconstruct(all_scores[-1] + 0.001)
+        kept = _build_kept(all_scores[-1] + 0.001)
+        final, final_size = _reconstruct_from_kept(kept)
         if final_size > budget:
             return text[:budget]
         return final
