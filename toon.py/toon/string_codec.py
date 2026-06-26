@@ -516,6 +516,76 @@ _DOC_TAG_RE = re.compile(
 _MIN_OMISSION_THRESHOLD = 3
 
 
+# Common boilerplate names that don't add signal as query terms
+_AUTO_QUERY_SKIP = frozenset(
+    {
+        "get", "set", "add", "run", "main", "init", "call",
+        "start", "stop", "open", "close", "read", "write", "send",
+        "make", "build", "create", "delete", "update", "fetch", "load",
+        "save", "find", "list", "show", "exec", "do", "new", "old",
+        "check", "test", "is", "has", "can", "should", "will", "parse",
+        "format", "convert", "compute", "calculate", "setup", "teardown",
+        "reset", "clear", "push", "pop", "insert", "remove", "replace",
+    }
+)
+
+
+def _auto_query_from_symbols(anchor_groups: list[dict]) -> str | None:
+    """Extract a relevance query from distinctive function/class names.
+
+    Collects all non-boilerplate symbol names, splits on underscores and
+    camelCase boundaries, and returns them as a space-separated query.
+    """
+    import re as _re
+
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    for g in anchor_groups:
+        name = g["name"]
+        if not name or name.startswith("_"):
+            continue
+        name_lower = name.lower()
+        if name_lower in _AUTO_QUERY_SKIP:
+            continue
+
+        # Split on underscores and camelCase boundaries
+        parts = [p for p in _re.split(r"[_ ]+", name) if p]
+        expanded: list[str] = []
+        for p in parts:
+            expanded.extend(
+                w.lower() for w in _re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)", p)
+                if len(w) >= 2
+            )
+
+        for term in expanded:
+            if term not in seen and term not in _AUTO_QUERY_SKIP:
+                seen.add(term)
+                terms.append(term)
+
+    return " ".join(terms) if terms else None
+
+
+# Match Python type annotations: ": Type" after params and "-> Type" at end
+_PY_TYPE_HINT_RE = re.compile(r":\s*\w+(?:\[.*?\]|\[.*)?(?:\s*\|\s*\w+(?:\[.*?\])?)*")
+_PY_RETURN_TYPE_RE = re.compile(r"\s*->\s*\S+(?:\[.*?\])?\s*:")
+
+
+def _strip_sig(line: str, is_python: bool) -> str:
+    """Strip type annotations from a function/method signature line."""
+    if is_python:
+        # Remove parameter type annotations: ": Type" after parameters
+        # Be conservative: only strip within parens
+        stripped = _PY_TYPE_HINT_RE.sub("", line)
+        # Remove return type: "-> Type:"
+        stripped = _PY_RETURN_TYPE_RE.sub(":", stripped)
+        return stripped
+    else:
+        # TS/JS: strip ": type" after params
+        stripped = re.sub(r":\s*\w+(?:\[\])?(?:\s*\|\s*\w+(?:\[\])?)*", "", line)
+        return stripped
+
+
 def _apply_query_relevance(
     query: str,
     anchor_groups: list[dict],
@@ -655,7 +725,9 @@ def _compress_source_code(text: str, budget: int, query: str | None = None) -> s
     # Parse lines into anchor groups
     # Each def/class/function starts an anchor_group. Lines between groups
     # (imports, constants, logger setup) are always included.
-    always_lines: list[int] = []  # imports + top-level code
+    always_lines: list[int] = []  # top-level code (NOT imports)
+    import_lines: list[int] = []  # import lines (collapsed to summary)
+    import_packages: set[str] = set()  # unique top-level packages
     anchor_groups: list[dict] = []
     pending_decorators: list[int] = []
     current_group: dict | None = None
@@ -671,10 +743,32 @@ def _compress_source_code(text: str, budget: int, query: str | None = None) -> s
             continue
 
         if _SOURCE_IMPORT_RE.match(line):
-            always_lines.append(i)
+            import_lines.append(i)
+            # Extract top-level package for summary
+            stripped_lower = stripped.lower()
+            # Extract package: "from X import Y" -> X.split('.')[0]
+            # or "import X" -> X.split('.')[0]
+            if stripped_lower.startswith("from "):
+                pkg = stripped.split()[1].split(".")[0]
+                import_packages.add(pkg)
+            elif stripped_lower.startswith("import "):
+                pkg = stripped.split()[1].split(".")[0].rstrip(",")
+                import_packages.add(pkg)
             current_group = None
             pending_decorators = []
             continue
+
+        # Multi-line import continuation (indented names/commas inside import block)
+        if import_lines and not current_group:
+            line_indent = len(line) - len(line.lstrip())
+            if line_indent > 0 and re.match(
+                    r'^\s+(?:[\w.]+\s*,?\s*)+$', line):
+                import_lines.append(i)
+                continue
+            # Closing paren on its own line after import block
+            if re.match(r'^\s*\)\s*$', stripped):
+                import_lines.append(i)
+                continue
 
         if _DECORATOR_RE.match(line):
             pending_decorators.append(i)
@@ -711,10 +805,12 @@ def _compress_source_code(text: str, budget: int, query: str | None = None) -> s
             always_lines.append(i)
 
     # Query-guided relevance scoring for body priority
-    if query and anchor_groups:
-        _apply_query_relevance(query, anchor_groups, lines)
+    # Auto-query: if no explicit query provided, derive from symbol names
+    effective_query = query or _auto_query_from_symbols(anchor_groups)
+    if effective_query and anchor_groups:
+        _apply_query_relevance(effective_query, anchor_groups, lines)
 
-    # Build mandatory set
+    # Build mandatory set (signatures + top-level code, NOT raw imports)
     mandatory: set[int] = set(mod_doc_keep)
     mandatory.update(always_lines)
     for g in anchor_groups:
@@ -734,6 +830,12 @@ def _compress_source_code(text: str, budget: int, query: str | None = None) -> s
     mandatory_chars = sum(lc(i) for i in mandatory)
     if mod_doc_omitted:
         mandatory_chars += 50
+    # Compact import summary instead of raw import lines
+    import_summary = ""
+    if import_packages:
+        pkg_list = ", ".join(sorted(import_packages))
+        import_summary = f"# imports: {pkg_list}\n"
+        mandatory_chars += len(import_summary)
     remaining = max(0, budget - mandatory_chars)
 
     # Fill bodies by priority
@@ -776,13 +878,29 @@ def _compress_source_code(text: str, budget: int, query: str | None = None) -> s
     if mod_doc_omitted:
         result.append(f"# ... [{mod_doc_omitted} docstring lines omitted]")
 
-    # Scan remaining lines in order, inserting omission markers at cut points
+    # Scan remaining lines in order, inserting omission markers at cut points.
+    # Reconstruct with: import summary → stripped signatures → body content.
     pending_blanks: list[str] = []
     omit_count = 0
     omit_indent = "    "
 
+    # Emit compact import summary at top (before any other lines)
+    if import_summary:
+        result.append(import_summary.rstrip("\n"))
+
+    # Build set of sig lines for annotation stripping
+    sig_set = {g["sig_line"] for g in anchor_groups}
+    is_python = any(
+        lines[i].strip().startswith(("def ", "class "))
+        for i in sig_set if i < n)
+
     for i, line in enumerate(lines):
         if i in mod_doc_set:
+            continue
+
+        # Skip raw import lines (replaced by summary)
+        if i in import_lines:
+            pending_blanks = []
             continue
 
         if not line.strip():
@@ -796,8 +914,10 @@ def _compress_source_code(text: str, budget: int, query: str | None = None) -> s
                 omit_count = 0
             result.extend(pending_blanks)
             pending_blanks = []
-            result.append(line)
-            omit_indent = " " * (len(line) - len(line.lstrip()) + 4)
+            # Strip type annotations from signature lines
+            emitted = _strip_sig(line, is_python) if i in sig_set else line
+            result.append(emitted)
+            omit_indent = " " * (len(emitted) - len(emitted.lstrip()) + 4)
         else:
             pending_blanks = []  # discard blanks belonging to omitted section
             omit_count += 1
