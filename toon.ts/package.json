@@ -17,6 +17,6 @@
     "web-tree-sitter": "^0.26.8"
   },
   "devDependencies": {
-    "@types/node": "^25.6.0"
+    "@types/node": "^26.5.1"
   }
 }
