@@ -117,5 +117,6 @@ jobs:
           repo_id: ${{ inputs.repo_id || '' }}
           vulnerabilities: ${{ inputs.vulnerabilities }}
           verbose: ${{ inputs.verbose || 'false' }}
+          create-pr: true
         env:
           AGP_API_URL: ${{ vars.AGP_API_URL }}
